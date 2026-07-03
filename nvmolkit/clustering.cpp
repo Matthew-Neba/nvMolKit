@@ -43,7 +43,7 @@ BOOST_PYTHON_MODULE(_clustering) {
       if (!streamOpt) {
         throw std::invalid_argument("Invalid CUDA stream");
       }
-      auto                             stream  = *streamOpt;
+      auto                             stream                = *streamOpt;
       // Extract boost::python::tuple from dict['shape']
       boost::python::tuple             shape   = boost::python::extract<boost::python::tuple>(distanceMatrix["shape"]);
       const size_t                     matDim1 = boost::python::extract<size_t>(shape[0]);
