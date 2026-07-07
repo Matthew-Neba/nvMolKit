@@ -42,6 +42,7 @@ namespace nvMolKit {
  * @param reordering Whether to dynamically reorder candidates after each cluster assignment.
  * @param stream CUDA stream to execute operations on. Defaults to stream 0.
  * @param reordering Whether to dynamically reorder candidates after each cluster assignment.
+ * @param stream CUDA stream to execute operations on. Defaults to stream 0.
  * @return Number of clusters assigned.
  */
 [[maybe_unused]] int butinaGpu(cuda::std::span<const double> distanceMatrix,
@@ -70,6 +71,7 @@ namespace nvMolKit {
  * @param reordering Whether to dynamically reorder candidates after each cluster assignment.
  * @param stream CUDA stream to execute operations on. Defaults to stream 0.
  * @param reordering Whether to dynamically reorder candidates after each cluster assignment.
+ * @param stream CUDA stream to execute operations on. Defaults to stream 0.
  * @return Number of clusters assigned.
  */
 [[maybe_unused]] int butinaGpu(cuda::std::span<const uint8_t> hitMatrix,
