@@ -32,13 +32,14 @@ namespace nvMolKit {
  *                       contains the distance between items i and j.
  * @param clusters Output array of size N. Each element will contain the cluster ID for
  *                 that item. Modified in-place.
- * @param cutoff Distance threshold for clustering. Items with distance < cutoff are
+ * @param cutoff Distance threshold for clustering. Items with distance <= cutoff are
  *               considered neighbors.
  * @param neighborlistMaxSize Maximum size of the neighborlist used for small cluster optimization.
  *                            Must be 8, 16, 24, 32, 64, or 128. Larger values allow parallel
  *                            processing of larger clusters but use more memory.
  * @param centroids Optional output array of size N. If provided, centroids[i] stores the
  *                  centroid index for cluster i. Must be empty or size N.
+ * @param reordering Whether to dynamically reorder candidates after each cluster assignment.
  * @param stream CUDA stream to execute operations on. Defaults to stream 0.
  * @return Number of clusters assigned.
  */
@@ -47,6 +48,7 @@ namespace nvMolKit {
                                double                        cutoff,
                                int                           neighborlistMaxSize = 64,
                                cuda::std::span<int>          centroids           = {},
+                               bool                          reordering          = true,
                                cudaStream_t                  stream              = nullptr);
 
 /**
@@ -56,7 +58,7 @@ namespace nvMolKit {
  * a binary hit matrix where element (i,j) indicates whether items i and j are neighbors.
  *
  * @param hitMatrix Binary matrix of size NxN where hitMatrix[i*N+j] = 1 if items i and j
- *                  are neighbors (distance < cutoff), 0 otherwise.
+ *                  are neighbors (distance <= cutoff), 0 otherwise.
  * @param clusters Output array of size N. Each element will contain the cluster ID for
  *                 that item. Modified in-place.
  * @param neighborlistMaxSize Maximum size of the neighborlist used for small cluster optimization.
@@ -64,6 +66,7 @@ namespace nvMolKit {
  *                            processing of larger clusters but use more memory.
  * @param centroids Optional output array of size N. If provided, centroids[i] stores the
  *                  centroid index for cluster i. Must be empty or size N.
+ * @param reordering Whether to dynamically reorder candidates after each cluster assignment.
  * @param stream CUDA stream to execute operations on. Defaults to stream 0.
  * @return Number of clusters assigned.
  */
@@ -71,6 +74,7 @@ namespace nvMolKit {
                                cuda::std::span<int>           clusters,
                                int                            neighborlistMaxSize = 64,
                                cuda::std::span<int>           centroids           = {},
+                               bool                           reordering          = true,
                                cudaStream_t                   stream              = nullptr);
 }  // namespace nvMolKit
 
