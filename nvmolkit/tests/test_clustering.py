@@ -308,6 +308,22 @@ def test_fused_butina_single_item():
     assert cluster_sizes == [0, 1]
 
 
+def test_fused_butina_empty():
+    x = torch.empty((0, 32), dtype=torch.int32, device="cuda")
+    clusters, cluster_sizes, centroids = fused_butina(x, cutoff=0.5, return_centroids=True)
+    assert clusters == []
+    assert cluster_sizes == [0]
+    assert centroids == []
+
+
+def test_fused_butina_noncontiguous():
+    x = generate_clustered_fingerprints(50, num_words=64, num_clusters=5)
+    view = x[:, ::2]
+    assert not view.is_contiguous()
+    clusters, cluster_sizes = fused_butina(view, cutoff=0.4)
+    check_fused_butina_basic(clusters, cluster_sizes, view.shape[0])
+
+
 @pytest.mark.parametrize("metric", ["tanimoto", "cosine"])
 def test_fused_butina_all_identical(metric):
     n = 50

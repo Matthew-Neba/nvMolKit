@@ -123,6 +123,12 @@ target_link_libraries(
   PUBLIC device_vector
   PRIVATE cub_helpers nvtx)
 
+add_library(fused_butina fused_butina.cu)
+target_link_libraries(
+  fused_butina
+  PUBLIC device_vector
+  PRIVATE cuda_error_check cub_helpers)
+
 add_library(conformer_rmsd conformer_rmsd.cu)
 target_link_libraries(
   conformer_rmsd

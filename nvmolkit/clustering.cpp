@@ -19,6 +19,7 @@
 
 #include "nvmolkit/array_helpers.h"
 #include "src/butina.h"
+#include "src/fused_butina.h"
 #include "src/utils/device.h"
 
 namespace {
@@ -74,4 +75,54 @@ BOOST_PYTHON_MODULE(_clustering) {
      boost::python::arg("return_centroids")      = false,
      boost::python::arg("reordering")            = true,
      boost::python::arg("stream")                = 0));
+
+  boost::python::def(
+    "fused_butina",
+    +[](const boost::python::dict& fingerprints,
+        const double               cutoff,
+        const std::string&         metric,
+        std::uintptr_t             streamPtr) -> boost::python::tuple {
+      auto streamOpt = nvMolKit::acquireExternalStream(streamPtr);
+      if (!streamOpt) {
+        throw std::invalid_argument("Invalid CUDA stream");
+      }
+      const auto           stream = *streamOpt;
+      boost::python::tuple shape  = boost::python::extract<boost::python::tuple>(fingerprints["shape"]);
+      if (len(shape) != 2) {
+        throw std::invalid_argument("fingerprints must be a 2D matrix");
+      }
+      const int            n           = boost::python::extract<int>(shape[0]);
+      const int            numWords    = boost::python::extract<int>(shape[1]);
+      boost::python::tuple data        = boost::python::extract<boost::python::tuple>(fingerprints["data"]);
+      const std::size_t    dataPointer = boost::python::extract<std::size_t>(data[0]);
+      const auto span = nvMolKit::getSpanFromDictElems<std::uint32_t>(reinterpret_cast<void*>(dataPointer), shape);
+
+      nvMolKit::FingerprintSimilarityMetric parsedMetric;
+      if (metric == "tanimoto") {
+        parsedMetric = nvMolKit::FingerprintSimilarityMetric::Tanimoto;
+      } else if (metric == "cosine") {
+        parsedMetric = nvMolKit::FingerprintSimilarityMetric::Cosine;
+      } else {
+        throw std::invalid_argument("metric must be one of ['tanimoto', 'cosine']");
+      }
+
+      auto                result = nvMolKit::fusedButinaGpu(span, n, numWords, cutoff, parsedMetric, stream);
+      boost::python::list members;
+      boost::python::list offsets;
+      boost::python::list centroids;
+      for (const int value : result.clusterMembers) {
+        members.append(value);
+      }
+      for (const int value : result.clusterOffsets) {
+        offsets.append(value);
+      }
+      for (const int value : result.centroids) {
+        centroids.append(value);
+      }
+      return boost::python::make_tuple(members, offsets, centroids);
+    },
+    (boost::python::arg("fingerprints"),
+     boost::python::arg("cutoff"),
+     boost::python::arg("metric") = "tanimoto",
+     boost::python::arg("stream") = 0));
 };
