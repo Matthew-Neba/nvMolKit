@@ -21,9 +21,9 @@ matrix or plan to reuse it (e.g. at multiple cutoffs), and when N is small
 enough that the O(N^2) matrix fits comfortably in GPU memory.
 
 ``fused_butina()`` avoids materializing the distance matrix entirely.  Each
-clustering round recomputes only the similarities it needs on the fly using
-Triton kernels that fuse popcount-based fingerprint similarity with the
-neighbor-count and cluster-extraction steps.  This trades extra compute for
+clustering round recomputes only the similarities it needs on the fly with
+CUDA kernels that fuse popcount-based fingerprint similarity with the
+neighbor-count and cluster-extraction steps. This trades extra compute for
 drastically lower memory: usage is O(N) rather than O(N^2), making it the
 better choice for large N where the full matrix would be prohibitively large.
 """

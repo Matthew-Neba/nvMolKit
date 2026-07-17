@@ -22,7 +22,7 @@ nvMolKit 0.5.0 adds three new GPU-accelerated APIs: Torsion Fingerprint Deviatio
 - `HardwareOptions` support for MMFF minimization, matching the ETKDG hardware-targeting API
 - Device-side output for ETKDG and forcefield optimization, allowing GPU tensors to flow between nvMolKit calls without round-tripping through host memory ([#140](https://github.com/NVIDIA-Digital-Bio/nvMolKit/issues/140))
 - Python autotuning library for the main APIs (`nvmolkit.autotune`), including ETKDG, forcefield optimization, and substructure search, with configuration serialization ([#141](https://github.com/NVIDIA-Digital-Bio/nvMolKit/issues/141))
-- Low-memory fused Butina clustering that computes Tanimoto similarities on the fly with Triton-backed kernels, avoiding the O(N²) distance matrix and enabling clustering of larger fingerprint datasets on a single GPU ([#110](https://github.com/NVIDIA-Digital-Bio/nvMolKit/issues/110))
+- Low-memory fused Butina clustering that computes Tanimoto similarities on the fly with CUDA kernels, avoiding the O(N²) distance matrix and enabling clustering of larger fingerprint datasets on a single GPU ([#110](https://github.com/NVIDIA-Digital-Bio/nvMolKit/issues/110))
 - Support for Blackwell and L-class GPUs, including sm_103 SASS for B300
 
 ### Bug Fixes
