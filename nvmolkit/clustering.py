@@ -122,8 +122,8 @@ def fused_butina(
     x: ArrayInput,
     cutoff: float,
     return_centroids: bool = False,
-    stream: torch.cuda.Stream | None = None,
     metric: str = "tanimoto",
+    stream: torch.cuda.Stream | None = None,
 ):
     """Perform fused Butina clustering on a set of fingerprints.
 
@@ -138,9 +138,9 @@ def fused_butina(
         cutoff: Distance threshold for clustering. Items are neighbors if their
                 distance is less than this cutoff (i.e. similarity > 1 - cutoff).
         return_centroids: Whether to return centroid indices for each cluster.
-        stream: CUDA stream to use. If None, uses the current stream.
         metric: Metric to use for similarity computation. Currently only "tanimoto"
                 and "cosine" are supported.
+        stream: CUDA stream to use. If None, uses the current stream.
 
     Returns:
         A tuple ``(clusters, cluster_sizes)`` where *clusters* is a list of tuples

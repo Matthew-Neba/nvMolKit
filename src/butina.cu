@@ -24,7 +24,7 @@
 
 /**
  * TODO: Future optimizations
- * - Keep a live list of active indices and only dispatch counts for those.
+ * - Keep a live list of active indices and only dispatch counts for those (stream compaction?)
  */
 namespace nvMolKit {
 

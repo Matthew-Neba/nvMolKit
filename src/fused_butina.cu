@@ -108,10 +108,10 @@ __global__ void fingerprintBitCountKernel(const cuda::std::span<const std::uint3
 }
 
 // Compute the initial active-neighbor count for every fingerprint without storing an N x N matrix.
-//
-// Each molecule will be assigned a block with some threads (128 for now). Then each threads will compute whether the
-// current molecule is a neighbor of the other molecules. Note: we are tiling so each thread jumps ahead by the block
-// size (128 for now).
+
+//  Each molecule will be assigned a block with some threads (128 for now). Then each threads will compute whether the
+// current molecule is a neighbor of the other molecules. Note: we are tiling in 2 dimensions, 1) molecules, 2) words
+// for each fingerprint
 template <FingerprintSimilarityMetric Metric>
 __global__ void initialNeighborCountKernel(const cuda::std::span<const std::uint32_t> fingerprints,
                                            const cuda::std::span<const int>           bitCounts,
@@ -149,14 +149,15 @@ __global__ void initialNeighborCountKernel(const cuda::std::span<const std::uint
         candidateWords[item] =
           sourceRow < n && sourceWord < numWords ? fingerprints[sourceRow * numWords + sourceWord] : 0;
       }
-      // wait for all the fingerprint segments to be loaded into shared memory
+      // wait for the current centroid segment to be loaded into memory
       __syncthreads();
       if (candidateRow < n) {
         for (int word = 0; word < kWordTileSize; ++word) {
           intersection += __popc(centerWords[word] & candidateWords[threadIdx.x * kWordTileSize + word]);
         }
       }
-      // wait so that a thread doesn't erase a segment from memory that another thread is reading
+      // wait so that a thread doesn't erase a segment from memory that another thread is reading (centroid segments to
+      // be precise)
       __syncthreads();
     }
 
@@ -182,6 +183,7 @@ __global__ void initialArgMaxKernel(const cuda::std::span<const int> neighborCou
     candidate = max(candidate, makeCandidate(neighborCounts[row], row));
   }
 
+  // reduce the results of the tiling
   __shared__ typename cub::BlockReduce<std::uint64_t, kInitialArgMaxBlockSize>::TempStorage storage;
   candidate = cub::BlockReduce<std::uint64_t, kInitialArgMaxBlockSize>(storage).Reduce(candidate, cubMax());
   if (threadIdx.x == 0) {
@@ -195,8 +197,6 @@ template <FingerprintSimilarityMetric Metric>
 __global__ void extractClusterKernel(const cuda::std::span<const std::uint32_t> fingerprints,
                                      const cuda::std::span<const int>           bitCounts,
                                      const cuda::std::span<std::uint8_t>        active,
-                                     const cuda::std::span<int>                 removedRows,
-                                     int*                                       removedCount,
                                      const cuda::std::span<int>                 clusterMembers,
                                      int*                                       outputCount,
                                      const int*                                 maxValue,
@@ -210,7 +210,7 @@ __global__ void extractClusterKernel(const cuda::std::span<const std::uint32_t> 
     return;
   }
 
-  // Compare this active molecule with the selected centroid. Determine if thier fingerprints are withign a similariy
+  // Compare this active molecule with the selected centroid. Determine if thier fingerprints are within a similariy
   // threshold
   const int center = *maxIndex;
   if (!fingerprintsWithinThreshold<Metric>(fingerprints.data() + center * numWords,
@@ -222,16 +222,13 @@ __global__ void extractClusterKernel(const cuda::std::span<const std::uint32_t> 
     return;
   }
 
-  // Mark matching molecules inactive, then append them to both the temporary removed row list and the final cluster
-  // member list. Need atomics here since we can get several matches at the same time.
+  // Need an atomic here since we can get several matches at the same time.
   active[row]                = 0;
-  const int removedSlot      = atomicAdd(removedCount, 1);
-  removedRows[removedSlot]   = row;
   const int outputSlot       = atomicAdd(outputCount, 1);
   clusterMembers[outputSlot] = row;
 }
 
-// Record the centroid and exclusive end offset after all members of the current cluster have been appended.
+// Record the centroid and the offset of that centroid's cluster members in the big clusterMembers arr.
 __global__ void recordClusterKernel(const int*                 maxValue,
                                     const int*                 maxIndex,
                                     const int*                 outputCount,
@@ -239,40 +236,40 @@ __global__ void recordClusterKernel(const int*                 maxValue,
                                     const cuda::std::span<int> clusterOffsets,
                                     const cuda::std::span<int> centroids) {
   // A maximum of one means that every remaining molecule only neighbors itself, so no non-singleton cluster was
-  // extracted during this graph iteration.
+  // extracted.
   if (*maxValue <= 1) {
     return;
   }
-  // Reserve the next cluster slot, save its centroid, and use the current output position as its exclusive end offset.
+  // Reserve the next cluster slot, save its centroid, and use the current output count as it's offset
   const int cluster           = atomicAdd(clusterCount, 1);
   centroids[cluster]          = *maxIndex;
   clusterOffsets[cluster + 1] = *outputCount;
 }
 
 // Update every active molecule's neighbor count after removing the current cluster, then produce one maximum candidate
-// per block. Each thread is assigned one molecule using its original row index.
+// per block.
 template <FingerprintSimilarityMetric Metric>
 __global__ void updateNeighborCountsAndBlockMaxKernel(const cuda::std::span<const std::uint32_t> fingerprints,
                                                       const cuda::std::span<const int>           bitCounts,
                                                       const cuda::std::span<const std::uint8_t>  active,
                                                       const cuda::std::span<int>                 neighborCounts,
-                                                      const cuda::std::span<const int>           removedRows,
-                                                      const int*                                 removedCount,
+                                                      const cuda::std::span<const int>           clusterMembers,
+                                                      const int*                                 clusterStart,
+                                                      const int*                                 outputCount,
                                                       const int*                                 maxIndex,
                                                       const cuda::std::span<std::uint64_t>       blockMaxima,
                                                       int                                        numWords,
                                                       float                                      threshold) {
-  const int row          = blockIdx.x * blockDim.x + threadIdx.x;
-  int       updatedCount = -1;
-  // Inactive and out-of-range rows keep the -1 sentinel so they cannot win the block maximum reduction.
+  const int row = blockIdx.x * blockDim.x + threadIdx.x;
+
+  int updatedCount = -1;
   if (row < static_cast<int>(active.size()) && active[row]) {
     int decrement = 0;
-    // Only compare against molecules removed in this iteration. This updates the existing count without rebuilding it
-    // against every molecule that is still active.
-    for (int slot = 0; slot < *removedCount; ++slot) {
-      const int removed = removedRows[slot];
-      // Extraction already proved that every surviving row is not a neighbor of the centroid. Do not recompute that
-      // similarity while subtracting the rest of the newly removed cluster.
+    // Only compare against members added to the current cluster in the current iteration step.
+    for (int memberSlot = *clusterStart; memberSlot < *outputCount; ++memberSlot) {
+      const int removed = clusterMembers[memberSlot];
+      // If we are here (active molecule) and we are comparing to the centroid, extractClusterKernel ran previously, and
+      // it must not have found this molecule to be within threshold
       if (removed == *maxIndex) {
         continue;
       }
@@ -298,22 +295,21 @@ __global__ void updateNeighborCountsAndBlockMaxKernel(const cuda::std::span<cons
   }
 }
 
-// Reduce the small block maximum array into the centroid for the next graph iteration.
+// Reduce the blockMaxima array into the centroid
 __global__ void selectNextCentroidKernel(const cuda::std::span<const std::uint64_t> blockMaxima,
                                          int*                                       maxValue,
                                          int*                                       maxIndex,
                                          cudaGraphConditionalHandle                 handle) {
   std::uint64_t candidate = 0;
-  // Each thread scans a strided section of the block maximum array and keeps its largest packed candidate.
+  // Once again we are tiling here
   for (int block = threadIdx.x; block < static_cast<int>(blockMaxima.size()); block += blockDim.x) {
     candidate = max(candidate, blockMaxima[block]);
   }
 
-  // Reduce the per-thread candidates to the global maximum neighbor count and original row index.
   __shared__ typename cub::BlockReduce<std::uint64_t, kIterationBlockSize>::TempStorage storage;
   candidate = cub::BlockReduce<std::uint64_t, kIterationBlockSize>(storage).Reduce(candidate, cubMax());
   if (threadIdx.x == 0) {
-    // Save the next centroid and continue the CUDA graph while a molecule has an active neighbor besides itself.
+    // Save the next centroid and continue the CUDA graph while a molecule has an active neighbor besides itself. We do this here instead of in another conditional checking kernel since we already have the maxNeighborCount in a register
     const int maxNeighborCount = storeCandidate(candidate, maxValue, maxIndex);
     cudaGraphSetConditional(handle, maxNeighborCount > 1 ? 1 : 0);
   }
@@ -366,9 +362,8 @@ template <FingerprintSimilarityMetric Metric> class FusedButinaLoopGraph {
                        const cuda::std::span<const int>           bitCounts,
                        const cuda::std::span<std::uint8_t>        active,
                        const cuda::std::span<int>                 neighborCounts,
-                       const cuda::std::span<int>                 removedRows,
-                       int*                                       removedCount,
                        const cuda::std::span<int>                 clusterMembers,
+                       int*                                       clusterStart,
                        int*                                       outputCount,
                        int*                                       clusterCount,
                        const cuda::std::span<int>                 clusterOffsets,
@@ -402,14 +397,10 @@ template <FingerprintSimilarityMetric Metric> class FusedButinaLoopGraph {
     cudaCheckError(
       cudaStreamBeginCaptureToGraph(captureStream, body, nullptr, nullptr, 0, cudaStreamCaptureModeRelaxed));
 
-    // Capture one complete clustering round. The graph's conditional node replays this body until the GPU-selected
-    // maximum has no active neighbor other than itself.
-    cudaCheckError(cudaMemsetAsync(removedCount, 0, sizeof(int), captureStream));
+    cudaCheckError(cudaMemcpyAsync(clusterStart, outputCount, sizeof(int), cudaMemcpyDeviceToDevice, captureStream));
     extractClusterKernel<Metric><<<numIterationBlocks, kIterationBlockSize, 0, captureStream>>>(fingerprints,
                                                                                                 bitCounts,
                                                                                                 active,
-                                                                                                removedRows,
-                                                                                                removedCount,
                                                                                                 clusterMembers,
                                                                                                 outputCount,
                                                                                                 maxValue,
@@ -429,8 +420,9 @@ template <FingerprintSimilarityMetric Metric> class FusedButinaLoopGraph {
                                                                       bitCounts,
                                                                       active,
                                                                       neighborCounts,
-                                                                      removedRows,
-                                                                      removedCount,
+                                                                      clusterMembers,
+                                                                      clusterStart,
+                                                                      outputCount,
                                                                       maxIndex,
                                                                       blockMaxima,
                                                                       numWords,
@@ -441,7 +433,7 @@ template <FingerprintSimilarityMetric Metric> class FusedButinaLoopGraph {
     cudaCheckError(cudaStreamEndCapture(captureStream, nullptr));
     cudaCheckError(cudaStreamDestroy(captureStream));
 
-    // Instantiate once per clustering call. All later rounds execute inside this graph with no Python or host loop.
+    // Instantiate once per clustering call. All later rounds execute inside this graph with no Python or host loop. =
     cudaCheckError(cudaGraphInstantiate(&graphExec_, graph_, nullptr, nullptr, 0));
   }
 
@@ -473,17 +465,16 @@ FusedButinaResult fusedButinaGpuImpl(cuda::std::span<const std::uint32_t> finger
                                      cudaStream_t                         stream) {
   ScopedNvtxRange setupRange("Fused Butina Setup");
 
-  // All buffers are O(N). Fingerprints remain in caller-owned storage and no pairwise matrix is allocated.
+  // All (non scalar) buffers are O(N). Fingerprints remain in caller-owned storage and no pairwise matrix is allocated.
   const int                        numIterationBlocks = (n + kIterationBlockSize - 1) / kIterationBlockSize;
   AsyncDeviceVector<int>           bitCounts(n, stream);
   AsyncDeviceVector<std::uint8_t>  active(n, stream);
   AsyncDeviceVector<int>           neighborCounts(n, stream);
-  AsyncDeviceVector<int>           removedRows(n, stream);
   AsyncDeviceVector<int>           clusterMembers(n, stream);
   AsyncDeviceVector<int>           clusterOffsets(n + 1, stream);
   AsyncDeviceVector<int>           centroids(n, stream);
   AsyncDeviceVector<std::uint64_t> blockMaxima(numIterationBlocks, stream);
-  AsyncDevicePtr<int>              removedCount(0, stream);
+  AsyncDevicePtr<int>              clusterStart(0, stream);
   AsyncDevicePtr<int>              outputCount(0, stream);
   AsyncDevicePtr<int>              clusterCount(0, stream);
   AsyncDevicePtr<int>              maxValue(-1, stream);
@@ -492,7 +483,6 @@ FusedButinaResult fusedButinaGpuImpl(cuda::std::span<const std::uint32_t> finger
   const auto bitCountsSpan      = toSpan(bitCounts);
   const auto activeSpan         = toSpan(active);
   const auto neighborCountsSpan = toSpan(neighborCounts);
-  const auto removedRowsSpan    = toSpan(removedRows);
   const auto clusterMembersSpan = toSpan(clusterMembers);
   const auto clusterOffsetsSpan = toSpan(clusterOffsets);
   const auto centroidsSpan      = toSpan(centroids);
@@ -514,16 +504,13 @@ FusedButinaResult fusedButinaGpuImpl(cuda::std::span<const std::uint32_t> finger
   cudaCheckError(cudaGetLastError());
   setupRange.pop();
 
-  // The graph owns all iterative control flow. No intermediate active mask, count vector, or cluster is copied to the
-  // host while it runs.
   ScopedNvtxRange              buildRange("Build fused Butina graph");
   FusedButinaLoopGraph<Metric> graph(fingerprints,
                                      bitCountsSpan,
                                      activeSpan,
                                      neighborCountsSpan,
-                                     removedRowsSpan,
-                                     removedCount.data(),
                                      clusterMembersSpan,
+                                     clusterStart.data(),
                                      outputCount.data(),
                                      clusterCount.data(),
                                      clusterOffsetsSpan,
@@ -547,8 +534,7 @@ FusedButinaResult fusedButinaGpuImpl(cuda::std::span<const std::uint32_t> finger
                                               centroidsSpan);
   cudaCheckError(cudaGetLastError());
 
-  // The public fused API returns Python cluster tuples, so finish with one batched synchronization after enqueueing all
-  // result copies. This replaces the two device-to-host synchronizations performed by every Python/Triton iteration.
+  // Copy the completed result to the host with one synchronization.
   int              outputCountHost  = 0;
   int              clusterCountHost = 0;
   std::vector<int> membersHost(n);
