@@ -7,8 +7,6 @@
 #include <cmath>
 #include <cstdint>
 #include <cub/block/block_reduce.cuh>
-#include <cub/device/device_select.cuh>
-#include <cub/iterator/counting_input_iterator.cuh>
 #include <stdexcept>
 #include <utility>
 #include <vector>
@@ -319,35 +317,32 @@ __global__ void selectNextCentroidKernel(const cuda::std::span<const std::uint64
   }
 }
 
-// Append the compacted active rows as singleton clusters. CUB's stable selection keeps original row order.
-__global__ void appendSingletonsKernel(const cuda::std::span<const int> singletonRows,
-                                       const int*                       singletonCount,
+// Append all molecules left active after the graph loop as singleton clusters. (can optimize this later, but this kernel usually takes less than 1% of execution time)
+__global__ void appendSingletonsKernel(const cuda::std::span<std::uint8_t> active,
                                        const cuda::std::span<int>       clusterMembers,
-                                       const int*                       outputCount,
-                                       const int*                       clusterCount,
+                                       int*                              outputCount,
+                                       int*                              clusterCount,
                                        const cuda::std::span<int>       clusterOffsets,
                                        const cuda::std::span<int>       centroids) {
-  const int singleton = blockIdx.x * blockDim.x + threadIdx.x;
-  if (singleton >= *singletonCount) {
+  // Use one thread so singleton clusters are emitted in deterministic original index order.
+  if (blockIdx.x != 0 || threadIdx.x != 0) {
     return;
   }
-
-  // Every remaining active molecule has no active neighbor other than itself, so write one complete singleton cluster.
-  const int row               = singletonRows[singleton];
-  const int output            = *outputCount + singleton;
-  const int cluster           = *clusterCount + singleton;
-  clusterMembers[output]      = row;
-  centroids[cluster]          = row;
-  clusterOffsets[cluster + 1] = output + 1;
-}
-
-// Advance the output sizes after all singleton writes have completed. Will be used on the CPU side to resize the
-// preallocated buffers that we can now shrink.
-__global__ void finishSingletonsKernel(const int* singletonCount, int* outputCount, int* clusterCount) {
-  if (blockIdx.x == 0 && threadIdx.x == 0) {
-    *outputCount += *singletonCount;
-    *clusterCount += *singletonCount;
+  int output  = *outputCount;
+  int cluster = *clusterCount;
+  // Every remaining active molecule has no active neighbor other than itself, so append it as one complete cluster.
+  for (int row = 0; row < static_cast<int>(active.size()); ++row) {
+    if (!active[row]) {
+      continue;
+    }
+    active[row]               = 0;
+    clusterMembers[output++]  = row;
+    centroids[cluster]        = row;
+    clusterOffsets[++cluster] = output;
   }
+  // Store the final output sizes for the host result copy.
+  *outputCount  = output;
+  *clusterCount = cluster;
 }
 
 // Reordering fused Butina pipeline:
@@ -480,10 +475,8 @@ FusedButinaResult fusedButinaGpuImpl(cuda::std::span<const std::uint32_t> finger
   AsyncDeviceVector<int>           clusterMembers(n, stream);
   AsyncDeviceVector<int>           clusterOffsets(n + 1, stream);
   AsyncDeviceVector<int>           centroids(n, stream);
-  AsyncDeviceVector<int>           singletonRows(n, stream);
   AsyncDeviceVector<std::uint64_t> blockMaxima(numIterationBlocks, stream);
   AsyncDevicePtr<int>              clusterStart(0, stream);
-  AsyncDevicePtr<int>              singletonCount(0, stream);
   AsyncDevicePtr<int>              outputCount(0, stream);
   AsyncDevicePtr<int>              clusterCount(0, stream);
   AsyncDevicePtr<int>              maxValue(-1, stream);
@@ -496,17 +489,6 @@ FusedButinaResult fusedButinaGpuImpl(cuda::std::span<const std::uint32_t> finger
   const auto clusterOffsetsSpan = toSpan(clusterOffsets);
   const auto centroidsSpan      = toSpan(centroids);
   const auto blockMaximaSpan    = toSpan(blockMaxima);
-
-  size_t singletonSelectTempBytes = 0;
-  cudaCheckError(cub::DeviceSelect::Flagged(nullptr,
-                                            singletonSelectTempBytes,
-                                            cub::CountingInputIterator<int>(0),
-                                            activeSpan.data(),
-                                            singletonRows.data(),
-                                            singletonCount.data(),
-                                            n,
-                                            stream));
-  AsyncDeviceVector<std::uint8_t> singletonSelectTemp(singletonSelectTempBytes, stream);
 
   cudaCheckError(cudaMemsetAsync(activeSpan.data(), 1, activeSpan.size_bytes(), stream));
   clusterOffsets.zero();
@@ -545,24 +527,12 @@ FusedButinaResult fusedButinaGpuImpl(cuda::std::span<const std::uint32_t> finger
   const ScopedNvtxRange loopRange("Fused Butina graph loop");
   graph.launch(stream);
 
-  // Compact active rows in original order, then append them as singleton clusters in parallel.
-  cudaCheckError(cub::DeviceSelect::Flagged(singletonSelectTemp.data(),
-                                            singletonSelectTempBytes,
-                                            cub::CountingInputIterator<int>(0),
-                                            activeSpan.data(),
-                                            singletonRows.data(),
-                                            singletonCount.data(),
-                                            n,
-                                            stream));
-  appendSingletonsKernel<<<numIterationBlocks, kIterationBlockSize, 0, stream>>>(toSpan(singletonRows),
-                                                                                 singletonCount.data(),
-                                                                                 clusterMembersSpan,
-                                                                                 outputCount.data(),
-                                                                                 clusterCount.data(),
-                                                                                 clusterOffsetsSpan,
-                                                                                 centroidsSpan);
-  cudaCheckError(cudaGetLastError());
-  finishSingletonsKernel<<<1, 1, 0, stream>>>(singletonCount.data(), outputCount.data(), clusterCount.data());
+  appendSingletonsKernel<<<1, 1, 0, stream>>>(activeSpan,
+                                               clusterMembersSpan,
+                                               outputCount.data(),
+                                               clusterCount.data(),
+                                               clusterOffsetsSpan,
+                                               centroidsSpan);
   cudaCheckError(cudaGetLastError());
 
   // Copy the completed result to the host with one synchronization.
@@ -579,6 +549,8 @@ FusedButinaResult fusedButinaGpuImpl(cuda::std::span<const std::uint32_t> finger
   if (clusterCountHost < 0 || clusterCountHost > n) {
     throw std::runtime_error("Fused Butina produced inconsistent output sizes");
   }
+
+  // resize since we originally allocated  O(n) bytes
   offsetsHost.resize(clusterCountHost + 1);
   centroidsHost.resize(clusterCountHost);
   return {std::move(membersHost), std::move(offsetsHost), std::move(centroidsHost)};
