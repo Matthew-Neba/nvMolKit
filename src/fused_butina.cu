@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <cub/block/block_reduce.cuh>
 #include <stdexcept>
@@ -102,7 +103,7 @@ __global__ void fingerprintBitCountKernel(const cuda::std::span<const std::uint3
   }
   int bitCount = 0;
   for (int word = 0; word < numWords; ++word) {
-    bitCount += __popc(fingerprints[row * numWords + word]);
+    bitCount += __popc(fingerprints[static_cast<std::size_t>(row) * numWords + word]);
   }
   bitCounts[row] = bitCount;
 }
@@ -138,7 +139,7 @@ __global__ void initialNeighborCountKernel(const cuda::std::span<const std::uint
       // we use the first threads to load the current segment of the centroids fingerprint
       if (threadIdx.x < kWordTileSize) {
         const int word           = wordStart + threadIdx.x;
-        centerWords[threadIdx.x] = word < numWords ? fingerprints[row * numWords + word] : 0;
+        centerWords[threadIdx.x] = word < numWords ? fingerprints[static_cast<std::size_t>(row) * numWords + word] : 0;
       }
       // now we can load the other molecules current segment
       for (int item = threadIdx.x; item < kCandidateTileSize * kWordTileSize; item += blockDim.x) {
@@ -146,8 +147,9 @@ __global__ void initialNeighborCountKernel(const cuda::std::span<const std::uint
         const int tileWord   = item % kWordTileSize;
         const int sourceRow  = candidateStart + tileRow;
         const int sourceWord = wordStart + tileWord;
-        candidateWords[item] =
-          sourceRow < n && sourceWord < numWords ? fingerprints[sourceRow * numWords + sourceWord] : 0;
+        candidateWords[item] = sourceRow < n && sourceWord < numWords ?
+                                 fingerprints[static_cast<std::size_t>(sourceRow) * numWords + sourceWord] :
+                                 0;
       }
       // wait for the current centroid segment to be loaded into memory
       __syncthreads();
@@ -213,8 +215,8 @@ __global__ void extractClusterKernel(const cuda::std::span<const std::uint32_t> 
   // Compare this active molecule with the selected centroid. Determine if thier fingerprints are within a similariy
   // threshold
   const int center = *maxIndex;
-  if (!fingerprintsWithinThreshold<Metric>(fingerprints.data() + center * numWords,
-                                           fingerprints.data() + row * numWords,
+  if (!fingerprintsWithinThreshold<Metric>(fingerprints.data() + static_cast<std::size_t>(center) * numWords,
+                                           fingerprints.data() + static_cast<std::size_t>(row) * numWords,
                                            bitCounts[center],
                                            bitCounts[row],
                                            numWords,
@@ -273,12 +275,13 @@ __global__ void updateNeighborCountsAndBlockMaxKernel(const cuda::std::span<cons
       if (removed == *maxIndex) {
         continue;
       }
-      decrement += fingerprintsWithinThreshold<Metric>(fingerprints.data() + row * numWords,
-                                                       fingerprints.data() + removed * numWords,
-                                                       bitCounts[row],
-                                                       bitCounts[removed],
-                                                       numWords,
-                                                       threshold);
+      decrement +=
+        fingerprintsWithinThreshold<Metric>(fingerprints.data() + static_cast<std::size_t>(row) * numWords,
+                                            fingerprints.data() + static_cast<std::size_t>(removed) * numWords,
+                                            bitCounts[row],
+                                            bitCounts[removed],
+                                            numWords,
+                                            threshold);
     }
     // Remove the matching rows from this molecule's stored active-neighbor count.
     updatedCount        = neighborCounts[row] - decrement;
