@@ -180,7 +180,7 @@ __global__ void initialArgMaxKernel(const cuda::std::span<const int> neighborCou
   std::uint64_t candidate = 0;
   // we tile over neighbors here
   for (int row = threadIdx.x; row < static_cast<int>(neighborCounts.size()); row += blockDim.x) {
-    candidate = max(candidate, makeCandidate(neighborCounts[row], row));
+    candidate = cubMax{}(candidate, makeCandidate(neighborCounts[row], row));
   }
 
   // reduce the results of the tiling
@@ -303,7 +303,7 @@ __global__ void selectNextCentroidKernel(const cuda::std::span<const std::uint64
   std::uint64_t candidate = 0;
   // Once again we are tiling here
   for (int block = threadIdx.x; block < static_cast<int>(blockMaxima.size()); block += blockDim.x) {
-    candidate = max(candidate, blockMaxima[block]);
+    candidate = cubMax{}(candidate, blockMaxima[block]);
   }
 
   __shared__ typename cub::BlockReduce<std::uint64_t, kIterationBlockSize>::TempStorage storage;
@@ -317,13 +317,14 @@ __global__ void selectNextCentroidKernel(const cuda::std::span<const std::uint64
   }
 }
 
-// Append all molecules left active after the graph loop as singleton clusters. (can optimize this later, but this kernel usually takes less than 1% of execution time)
+// Append all molecules left active after the graph loop as singleton clusters. (can optimize this later, but this
+// kernel usually takes less than 1% of execution time)
 __global__ void appendSingletonsKernel(const cuda::std::span<std::uint8_t> active,
-                                       const cuda::std::span<int>       clusterMembers,
-                                       int*                              outputCount,
-                                       int*                              clusterCount,
-                                       const cuda::std::span<int>       clusterOffsets,
-                                       const cuda::std::span<int>       centroids) {
+                                       const cuda::std::span<int>          clusterMembers,
+                                       int*                                outputCount,
+                                       int*                                clusterCount,
+                                       const cuda::std::span<int>          clusterOffsets,
+                                       const cuda::std::span<int>          centroids) {
   // Use one thread so singleton clusters are emitted in deterministic original index order.
   if (blockIdx.x != 0 || threadIdx.x != 0) {
     return;
@@ -528,11 +529,11 @@ FusedButinaResult fusedButinaGpuImpl(cuda::std::span<const std::uint32_t> finger
   graph.launch(stream);
 
   appendSingletonsKernel<<<1, 1, 0, stream>>>(activeSpan,
-                                               clusterMembersSpan,
-                                               outputCount.data(),
-                                               clusterCount.data(),
-                                               clusterOffsetsSpan,
-                                               centroidsSpan);
+                                              clusterMembersSpan,
+                                              outputCount.data(),
+                                              clusterCount.data(),
+                                              clusterOffsetsSpan,
+                                              centroidsSpan);
   cudaCheckError(cudaGetLastError());
 
   // Copy the completed result to the host with one synchronization.
