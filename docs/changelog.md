@@ -32,6 +32,8 @@ nvMolKit 0.5.0 adds three new GPU-accelerated APIs: Torsion Fingerprint Deviatio
 - Fix empty result handling in substructure search with `uniquify` when all matches were already unique ([#112](https://github.com/NVIDIA-Digital-Bio/nvMolKit/issues/112))
 
 ### Miscellaneous
+- `fused_butina()` now places its optional `stream` argument last; callers using positional arguments should pass
+  `metric` before `stream`.
 - pip wheel distribution pipeline (`pip install nvmolkit`) with manylinux_2_28 wheels for CPython 3.11-3.14 ([#15](https://github.com/NVIDIA-Digital-Bio/nvMolKit/issues/15))
 - RDKit support range is now 2025.03.1 through 2026.03.1
 - Validate `batchesPerGpu` in `HardwareOptions` so every consumer gets a clean `ValueError` instead of a cryptic C++ error from the MMFF / ETKDG layer ([#103](https://github.com/NVIDIA-Digital-Bio/nvMolKit/pull/103))

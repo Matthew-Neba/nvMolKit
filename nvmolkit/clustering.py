@@ -32,10 +32,16 @@ import torch
 
 from nvmolkit import _clustering
 from nvmolkit._arrayHelpers import *  # noqa: F403
-from nvmolkit._fusedButina import _check_fingerprint_matrix
 from nvmolkit.types import ArrayInput, AsyncGpuResult, _as_cuda_tensor, _resolve_cuda_stream, _validate_cuda_stream
 
 _VALID_NEIGHBORLIST_SIZES = frozenset({8, 16, 24, 32, 64, 128})
+
+
+def _check_fingerprint_matrix(name: str, x: torch.Tensor) -> None:
+    if x.dtype != torch.int32:
+        raise ValueError(f"{name} must have dtype int32")
+    if x.ndim != 2:
+        raise ValueError(f"{name} must be 2D, got shape={tuple(x.shape)}")
 
 
 def _check_distance_matrix(name: str, x: torch.Tensor) -> torch.Tensor:
@@ -80,10 +86,6 @@ def butina(
         reordering: Whether to update neighbor counts among unassigned items
                     after each cluster is formed. Defaults to True, while
                     RDKit's ``Butina.ClusterData`` defaults to False.
-        stream: CUDA stream to use. If None, uses the current stream.
-        reordering: Whether to update neighbor counts among unassigned items
-                    after each cluster is formed. The default matches the
-                    existing nvMolKit behavior and RDKit's ``reordering=True``.
         stream: CUDA stream to use. If None, uses the current stream.
 
     Returns:

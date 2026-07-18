@@ -436,7 +436,7 @@ template <FingerprintSimilarityMetric Metric> class FusedButinaLoopGraph {
     cudaCheckError(cudaStreamEndCapture(captureStream, nullptr));
     cudaCheckError(cudaStreamDestroy(captureStream));
 
-    // Instantiate once per clustering call. All later rounds execute inside this graph with no Python or host loop. =
+    // Instantiate once per clustering call. All later rounds execute inside this graph with no Python or host loop.
     cudaCheckError(cudaGraphInstantiate(&graphExec_, graph_, nullptr, nullptr, 0));
   }
 
