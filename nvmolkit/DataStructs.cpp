@@ -32,7 +32,8 @@ using ::nvMolKit::getSpanFromDictElems;
 template <typename ComputeFn>
 boost::python::numpy::ndarray crossSimilarityCPUFromRawBuffers(const boost::python::dict& bitsOne,
                                                                const boost::python::dict& bitsTwo,
-                                                               ComputeFn                  compute) {
+                                                               ComputeFn                  compute,
+                                                               cudaStream_t               stream) {
   // Extract boost::python::tuple from dict['shape']
   boost::python::tuple shapeOne = boost::python::extract<boost::python::tuple>(bitsOne["shape"]);
   boost::python::tuple shapeTwo = boost::python::extract<boost::python::tuple>(bitsTwo["shape"]);
@@ -56,7 +57,7 @@ boost::python::numpy::ndarray crossSimilarityCPUFromRawBuffers(const boost::pyth
   auto span1 = getSpanFromDictElems<std::uint32_t>(reinterpret_cast<void*>(data1Pointer), shapeOne);
   auto span2 = getSpanFromDictElems<std::uint32_t>(reinterpret_cast<void*>(data2Pointer), shapeTwo);
 
-  auto vec = compute(span1, span2, fpSize);
+  auto vec = compute(span1, span2, fpSize, stream);
 
   // Move vector to heap and tie lifetime to a capsule owner
   auto  heapVec = std::make_unique<std::vector<double>>(std::move(vec));
@@ -175,17 +176,35 @@ BOOST_PYTHON_MODULE(_DataStructs) {
 
   boost::python::def(
     "CrossTanimotoSimilarityCPURawBuffers",
-    +[](const boost::python::dict& bitsOne, const boost::python::dict& bitsTwo) {
-      return crossSimilarityCPUFromRawBuffers(bitsOne, bitsTwo, [](const auto& a, const auto& b, int fpSize) {
-        return nvMolKit::crossTanimotoSimilarityCPUResult(a, b, fpSize);
-      });
-    });
+    +[](const boost::python::dict& bitsOne, const boost::python::dict& bitsTwo, std::uintptr_t streamPtr) {
+      auto streamOpt = nvMolKit::acquireExternalStream(streamPtr);
+      if (!streamOpt) {
+        throw std::invalid_argument("Invalid CUDA stream");
+      }
+      return crossSimilarityCPUFromRawBuffers(
+        bitsOne,
+        bitsTwo,
+        [](const auto& a, const auto& b, int fpSize, cudaStream_t stream) {
+          return nvMolKit::crossTanimotoSimilarityCPUResult(a, b, fpSize, {}, stream);
+        },
+        *streamOpt);
+    },
+    (boost::python::arg("bitsOne"), boost::python::arg("bitsTwo"), boost::python::arg("stream") = 0));
 
   boost::python::def(
     "CrossCosineSimilarityCPURawBuffers",
-    +[](const boost::python::dict& bitsOne, const boost::python::dict& bitsTwo) {
-      return crossSimilarityCPUFromRawBuffers(bitsOne, bitsTwo, [](const auto& a, const auto& b, int fpSize) {
-        return nvMolKit::crossCosineSimilarityCPUResult(a, b, fpSize);
-      });
-    });
+    +[](const boost::python::dict& bitsOne, const boost::python::dict& bitsTwo, std::uintptr_t streamPtr) {
+      auto streamOpt = nvMolKit::acquireExternalStream(streamPtr);
+      if (!streamOpt) {
+        throw std::invalid_argument("Invalid CUDA stream");
+      }
+      return crossSimilarityCPUFromRawBuffers(
+        bitsOne,
+        bitsTwo,
+        [](const auto& a, const auto& b, int fpSize, cudaStream_t stream) {
+          return nvMolKit::crossCosineSimilarityCPUResult(a, b, fpSize, {}, stream);
+        },
+        *streamOpt);
+    },
+    (boost::python::arg("bitsOne"), boost::python::arg("bitsTwo"), boost::python::arg("stream") = 0));
 }

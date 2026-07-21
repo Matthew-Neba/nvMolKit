@@ -146,18 +146,18 @@ def test_butina_returns_centroids():
     dists = np.random.rand(n, n)
     dists = np.abs(dists - dists.T)
     torch_dists = torch.tensor(dists).to("cuda")
-    clusters, centroids = butina(torch_dists, cutoff, return_centroids=True)
-    clusters_tensor = clusters.torch()
+    cluster_ids, centroids = butina(torch_dists, cutoff, return_centroids=True)
+    cluster_ids_tensor = cluster_ids.torch()
     centroids_tensor = centroids.torch()
 
-    num_clusters = int(clusters_tensor.max().item()) + 1
+    num_clusters = int(cluster_ids_tensor.max().item()) + 1
     assert centroids_tensor.numel() == num_clusters
 
     adjacency = torch_dists <= cutoff
     for cluster_id in range(num_clusters):
         centroid = int(centroids_tensor[cluster_id].item())
-        assert clusters_tensor[centroid].item() == cluster_id
-        members = torch.nonzero(clusters_tensor == cluster_id, as_tuple=False).flatten()
+        assert cluster_ids_tensor[centroid].item() == cluster_id
+        members = torch.nonzero(cluster_ids_tensor == cluster_id, as_tuple=False).flatten()
         for member in members:
             assert adjacency[centroid, member].item()
 
@@ -255,22 +255,34 @@ def compute_pairwise_similarity_cpu(x_np, metric="tanimoto"):
     return sim
 
 
-def check_fused_butina_basic(clusters, cluster_sizes, n):
-    """Structural sanity checks on fused_butina output."""
+def check_fused_butina_basic(clusters, n):
+    """Structural sanity checks on clusters reconstructed from fused_butina output."""
     all_items = []
     for c in clusters:
         all_items.extend(c)
     assert sorted(all_items) == list(range(n)), "Not all items assigned exactly once"
 
-    assert cluster_sizes[0] == 0
-    assert cluster_sizes[-1] == n
-    assert len(cluster_sizes) == len(clusters) + 1
-    for i in range(len(clusters)):
-        assert cluster_sizes[i + 1] - cluster_sizes[i] == len(clusters[i])
-
     sizes = [len(c) for c in clusters]
     for i in range(len(sizes) - 1):
         assert sizes[i] >= sizes[i + 1], "Clusters not in non-increasing size order"
+
+
+def fused_butina_clusters(x, cutoff, metric="tanimoto", stream=None):
+    cluster_ids, centroids = fused_butina(
+        x,
+        cutoff,
+        return_centroids=True,
+        metric=metric,
+        stream=stream,
+    )
+    cluster_ids = cluster_ids.numpy()
+    centroids = centroids.numpy()
+
+    clusters = []
+    for cluster_id, centroid in enumerate(centroids):
+        members = np.flatnonzero(cluster_ids == cluster_id)
+        clusters.append(tuple([int(centroid)] + [int(member) for member in members if member != centroid]))
+    return tuple(clusters)
 
 
 # ---------------------------------------------------------------------------
@@ -292,9 +304,9 @@ def check_fused_butina_basic(clusters, cluster_sizes, n):
 def test_fused_butina_basic_correctness(n, metric, num_words):
     x = generate_clustered_fingerprints(n, num_words=num_words, num_clusters=10)
     cutoff = 0.4
-    clusters, cluster_sizes = fused_butina(x, cutoff=cutoff, metric=metric)
+    clusters = fused_butina_clusters(x, cutoff=cutoff, metric=metric)
 
-    check_fused_butina_basic(clusters, cluster_sizes, n)
+    check_fused_butina_basic(clusters, n)
 
     sim = compute_pairwise_similarity_cpu(x.cpu().numpy(), metric=metric)
     hit_mat = torch.tensor(sim >= (1.0 - cutoff), dtype=torch.bool).cuda()
@@ -303,10 +315,9 @@ def test_fused_butina_basic_correctness(n, metric, num_words):
 
 def test_fused_butina_single_item():
     x = torch.randint(-(2**31 - 1), 2**31 - 1, (1, 32), dtype=torch.int32).cuda()
-    clusters, cluster_sizes = fused_butina(x, cutoff=0.5)
+    clusters = fused_butina_clusters(x, cutoff=0.5)
     assert len(clusters) == 1
     assert clusters[0] == (0,)
-    assert cluster_sizes == [0, 1]
 
 
 @pytest.mark.parametrize("metric", ["tanimoto", "cosine"])
@@ -314,7 +325,7 @@ def test_fused_butina_all_identical(metric):
     n = 50
     base = torch.randint(-(2**31 - 1), 2**31 - 1, (1, 32), dtype=torch.int32).cuda()
     x = base.expand(n, -1).contiguous()
-    clusters, _cluster_sizes = fused_butina(x, cutoff=0.5, metric=metric)
+    clusters = fused_butina_clusters(x, cutoff=0.5, metric=metric)
     assert len(clusters) == 1
     assert len(clusters[0]) == n
     assert set(clusters[0]) == set(range(n))
@@ -325,26 +336,28 @@ def test_fused_butina_all_singletons(metric):
     n = 50
     torch.manual_seed(42)
     x = torch.randint(-(2**31 - 1), 2**31 - 1, (n, 32), dtype=torch.int32).cuda()
-    clusters, _cluster_sizes = fused_butina(x, cutoff=0.001, metric=metric)
+    clusters = fused_butina_clusters(x, cutoff=0.001, metric=metric)
     assert len(clusters) == n
     for c in clusters:
         assert len(c) == 1
 
 
 @pytest.mark.parametrize("n,metric", [(50, "tanimoto"), (50, "cosine"), (200, "tanimoto"), (200, "cosine")])
-def test_fused_butina_return_centroids(n, metric):
+def test_fused_butina_returns_centroids(n, metric):
     cutoff = 0.4
     x = generate_clustered_fingerprints(n, num_words=32, num_clusters=10)
-    clusters, _cluster_sizes, centroids = fused_butina(x, cutoff=cutoff, return_centroids=True, metric=metric)
+    cluster_ids, centroids = fused_butina(x, cutoff=cutoff, return_centroids=True, metric=metric)
+    cluster_ids = cluster_ids.numpy()
+    centroids = centroids.numpy()
 
-    assert len(centroids) == len(clusters)
     sim = compute_pairwise_similarity_cpu(x.cpu().numpy(), metric=metric)
     threshold = 1.0 - cutoff
 
-    for cluster, centroid in zip(clusters, centroids):
-        assert cluster[0] == centroid
+    for cluster_id, centroid in enumerate(centroids):
         assert 0 <= centroid < n
-        for member in cluster:
+        members = np.flatnonzero(cluster_ids == cluster_id)
+        assert centroid in members
+        for member in members:
             if member != centroid:
                 assert sim[centroid, member] >= threshold - 1e-6
 
@@ -353,7 +366,7 @@ def test_fused_butina_return_centroids(n, metric):
 def test_fused_butina_accepts_array_input_types(input_kind):
     x = generate_clustered_fingerprints(50, num_words=32, num_clusters=10)
     cutoff = 0.4
-    expected_clusters, expected_cluster_sizes = fused_butina(x, cutoff=cutoff)
+    expected_cluster_ids = fused_butina(x, cutoff=cutoff).torch().cpu()
 
     if input_kind == "async":
         inp = AsyncGpuResult(x)
@@ -362,19 +375,27 @@ def test_fused_butina_accepts_array_input_types(input_kind):
     else:
         inp = x.cpu().numpy()
 
-    clusters, cluster_sizes = fused_butina(inp, cutoff=cutoff)
-    assert [frozenset(cluster) for cluster in clusters] == [frozenset(cluster) for cluster in expected_clusters]
-    assert cluster_sizes == expected_cluster_sizes
-    check_fused_butina_basic(clusters, cluster_sizes, x.shape[0])
+    cluster_ids = fused_butina(inp, cutoff=cutoff).torch().cpu()
+    torch.testing.assert_close(cluster_ids, expected_cluster_ids)
+
+
+def test_fused_butina_accepts_int32_and_uint32():
+    fingerprints_int32 = generate_clustered_fingerprints(50, num_words=32, num_clusters=10)
+    fingerprints_uint32 = fingerprints_int32.view(torch.uint32)
+
+    expected_cluster_ids = fused_butina(fingerprints_int32, cutoff=0.4).torch()
+    cluster_ids = fused_butina(fingerprints_uint32, cutoff=0.4).torch()
+
+    torch.testing.assert_close(cluster_ids, expected_cluster_ids)
 
 
 def test_fused_butina_on_explicit_stream():
     n = 100
     x = generate_clustered_fingerprints(n, num_words=32, num_clusters=10)
     s = torch.cuda.Stream()
-    clusters, cluster_sizes = fused_butina(x, cutoff=0.4, stream=s)
+    cluster_ids = fused_butina(x, cutoff=0.4, stream=s)
     s.synchronize()
-    check_fused_butina_basic(clusters, cluster_sizes, n)
+    assert cluster_ids.torch().shape == (n,)
 
 
 def test_fused_butina_invalid_metric():

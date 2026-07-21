@@ -75,6 +75,13 @@ def test_cross_similarity_fp_mismatch(simtype, size_limited_mols):
             crossCosineSimilarity(nvmolkit_fps_cu, nvmolkit_fps_cu2)
 
 
+def test_cross_similarity_zero_fingerprint():
+    fingerprint = torch.zeros((1, 8), dtype=torch.int32, device="cuda")
+
+    assert crossTanimotoSimilarity(fingerprint).torch().item() == 1.0
+    assert crossCosineSimilarity(fingerprint).torch().item() == 0.0
+
+
 # --------------------------------
 # Tanimoto similarity tests
 # --------------------------------

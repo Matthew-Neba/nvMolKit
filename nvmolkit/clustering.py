@@ -32,16 +32,17 @@ import torch
 
 from nvmolkit import _clustering
 from nvmolkit._arrayHelpers import *  # noqa: F403
-from nvmolkit.types import ArrayInput, AsyncGpuResult, _as_cuda_tensor, _resolve_cuda_stream, _validate_cuda_stream
+from nvmolkit._fingerprint_inputs import _prepare_packed_fingerprints
+from nvmolkit.types import ArrayInput, AsyncGpuResult, _as_cuda_tensor, _resolve_cuda_stream
 
 _VALID_NEIGHBORLIST_SIZES = frozenset({8, 16, 24, 32, 64, 128})
 
 
-def _check_fingerprint_matrix(name: str, x: torch.Tensor) -> None:
-    if x.dtype != torch.int32:
-        raise ValueError(f"{name} must have dtype int32")
-    if x.ndim != 2:
-        raise ValueError(f"{name} must be 2D, got shape={tuple(x.shape)}")
+def _wrap_result(result, return_centroids: bool):
+    if return_centroids:
+        cluster_ids, centroids = result
+        return AsyncGpuResult(cluster_ids), AsyncGpuResult(centroids)
+    return AsyncGpuResult(result)
 
 
 def _check_distance_matrix(name: str, x: torch.Tensor) -> torch.Tensor:
@@ -49,9 +50,7 @@ def _check_distance_matrix(name: str, x: torch.Tensor) -> torch.Tensor:
         raise ValueError(f"{name} must be a square 2D matrix, got shape={tuple(x.shape)}")
     if x.dtype != torch.float64:
         raise ValueError(f"{name} must have dtype float64")
-    if not x.is_contiguous():
-        x = x.contiguous()
-    return x
+    return x.contiguous()
 
 
 def butina(
@@ -90,8 +89,8 @@ def butina(
 
     Returns:
         AsyncGpuResult of shape ``(N,)`` with cluster IDs (cluster 0 is the
-        largest) when ``return_centroids`` is False.  When ``return_centroids``
-        is True, returns a tuple ``(clusters, centroids)`` where *centroids* is
+        largest) when ``return_centroids`` is False. When ``return_centroids``
+        is True, returns a tuple ``(cluster_ids, centroids)`` where *centroids* is
         an AsyncGpuResult of shape ``(num_clusters,)`` containing the centroid
         index for each cluster ID.
 
@@ -114,10 +113,7 @@ def butina(
             reordering,
             active_stream.cuda_stream,
         )
-    if return_centroids:
-        clusters, centroids = result
-        return AsyncGpuResult(clusters), AsyncGpuResult(centroids)
-    return AsyncGpuResult(result)
+        return _wrap_result(result, return_centroids)
 
 
 def fused_butina(
@@ -126,7 +122,7 @@ def fused_butina(
     return_centroids: bool = False,
     metric: str = "tanimoto",
     stream: torch.cuda.Stream | None = None,
-):
+) -> AsyncGpuResult | tuple[AsyncGpuResult, AsyncGpuResult]:
     """Perform fused Butina clustering on a set of fingerprints.
 
     This function uses a fused implementation of Butina clustering that computes
@@ -134,47 +130,31 @@ def fused_butina(
     the full distance matrix. This makes it suitable for large datasets.
 
     Args:
-        x: Tensor-like object of shape (N, D) containing packed int32 fingerprints
+        x: Tensor-like object of shape (N, D) containing packed int32 or uint32 fingerprints
            to cluster. Can be an AsyncGpuResult, torch.Tensor, or numpy.ndarray.
            CPU tensors and NumPy arrays are copied to CUDA.
         cutoff: Distance threshold for clustering. Items are neighbors if their
-                distance is less than this cutoff (i.e. similarity > 1 - cutoff).
+                distance is at most this cutoff (i.e. similarity >= 1 - cutoff).
         return_centroids: Whether to return centroid indices for each cluster.
         metric: Metric to use for similarity computation. Currently only "tanimoto"
                 and "cosine" are supported.
         stream: CUDA stream to use. If None, uses the current stream.
 
     Returns:
-        A tuple ``(clusters, cluster_sizes)`` where *clusters* is a list of tuples
-        representing each cluster (with the first element being the centroid), and
-        *cluster_sizes* is a list of cumulative cluster sizes.
-        If ``return_centroids`` is True, returns a tuple ``(clusters, cluster_sizes, centroids)``
-        where *centroids* is a list of centroid indices.
+        AsyncGpuResult of shape ``(N,)`` containing one cluster ID per input item
+        when ``return_centroids`` is False. When ``return_centroids`` is True,
+        returns ``(cluster_ids, centroids)``, where *centroids* contains the input
+        index selected as the centroid for each cluster ID.
     """
     if metric not in ["tanimoto", "cosine"]:
         raise ValueError(f"metric must be one of ['tanimoto', 'cosine'], got {metric}")
 
-    _validate_cuda_stream(stream)
-
     if cutoff < 0 or cutoff > 1:
         raise ValueError(f"cutoff must be in [0, 1], got {cutoff}")
 
-    active_stream = _resolve_cuda_stream(stream, x)
+    (x,), active_stream = _prepare_packed_fingerprints(("x", x), stream=stream)
     with torch.cuda.stream(active_stream):
-        x = _as_cuda_tensor("x", x, stream=active_stream)
-        _check_fingerprint_matrix("x", x)
-        if not x.is_contiguous():
-            x = x.contiguous()
-        members, cluster_sizes, centroids = _clustering.fused_butina(
-            x.__cuda_array_interface__, cutoff, metric, active_stream.cuda_stream
+        result = _clustering.fused_butina(
+            x.__cuda_array_interface__, cutoff, return_centroids, metric, active_stream.cuda_stream
         )
-
-    clusters = []
-    for cluster_id, centroid in enumerate(centroids):
-        start = cluster_sizes[cluster_id]
-        end = cluster_sizes[cluster_id + 1]
-        cluster_members = members[start:end]
-        clusters.append(tuple([centroid] + [member for member in cluster_members if member != centroid]))
-    if return_centroids:
-        return clusters, cluster_sizes, centroids
-    return clusters, cluster_sizes
+        return _wrap_result(result, return_centroids)

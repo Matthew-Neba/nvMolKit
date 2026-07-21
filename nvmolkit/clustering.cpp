@@ -19,7 +19,6 @@
 
 #include "nvmolkit/array_helpers.h"
 #include "src/butina.h"
-#include "src/fused_butina.h"
 #include "src/utils/device.h"
 
 namespace {
@@ -27,6 +26,16 @@ namespace {
 boost::python::object toOwnedPyArray(nvMolKit::PyArray* array) {
   using Converter = boost::python::manage_new_object::apply<nvMolKit::PyArray*>::type;
   return boost::python::object(boost::python::handle<>(Converter()(array)));
+}
+
+boost::python::object wrapButinaResult(nvMolKit::ButinaResult& result, const int numItems, const bool returnCentroids) {
+  auto clusterArray = nvMolKit::makePyArray(result.clusterIds, boost::python::make_tuple(numItems));
+  if (!returnCentroids) {
+    return toOwnedPyArray(clusterArray);
+  }
+
+  auto centroidArray = nvMolKit::makePyArray(result.centroids, boost::python::make_tuple(result.numClusters));
+  return boost::python::make_tuple(toOwnedPyArray(clusterArray), toOwnedPyArray(centroidArray));
 }
 
 }  // namespace
@@ -44,30 +53,22 @@ BOOST_PYTHON_MODULE(_clustering) {
       if (!streamOpt) {
         throw std::invalid_argument("Invalid CUDA stream");
       }
-      auto                             stream  = *streamOpt;
+      const auto           stream  = *streamOpt;
       // Extract boost::python::tuple from dict['shape']
-      boost::python::tuple             shape   = boost::python::extract<boost::python::tuple>(distanceMatrix["shape"]);
-      const size_t                     matDim1 = boost::python::extract<size_t>(shape[0]);
-      nvMolKit::AsyncDeviceVector<int> clusterIds(matDim1, stream);
-      nvMolKit::AsyncDeviceVector<int> centroids;
+      boost::python::tuple shape   = boost::python::extract<boost::python::tuple>(distanceMatrix["shape"]);
+      const int            matDim1 = boost::python::extract<int>(shape[0]);
 
       boost::python::tuple data        = boost::python::extract<boost::python::tuple>(distanceMatrix["data"]);
       const size_t         dataPointer = boost::python::extract<std::size_t>(data[0]);
       const auto matSpan = nvMolKit::getSpanFromDictElems<double>(reinterpret_cast<void*>(dataPointer), shape);
-      if (returnCentroids) {
-        centroids.resize(matDim1);
-        centroids.setStream(stream);
-      }
-      const auto centroidSpan = returnCentroids ? toSpan(centroids) : cuda::std::span<int>{};
-      const int  numClusters =
-        nvMolKit::butinaGpu(matSpan, toSpan(clusterIds), cutoff, neighborlistMaxSize, centroidSpan, reordering, stream);
-      if (returnCentroids) {
-        auto clusterArray  = nvMolKit::makePyArray(clusterIds, boost::python::make_tuple(matDim1));
-        auto centroidArray = nvMolKit::makePyArray(centroids, boost::python::make_tuple(numClusters));
-        return boost::python::make_tuple(toOwnedPyArray(clusterArray), toOwnedPyArray(centroidArray));
-      }
-
-      return toOwnedPyArray(nvMolKit::makePyArray(clusterIds, boost::python::make_tuple(matDim1)));
+      auto       result  = nvMolKit::butinaFromDistanceMatrix(matSpan,
+                                                       matDim1,
+                                                       cutoff,
+                                                       neighborlistMaxSize,
+                                                       returnCentroids,
+                                                       reordering,
+                                                       stream);
+      return wrapButinaResult(result, matDim1, returnCentroids);
     },
     (boost::python::arg("distance_matrix"),
      boost::python::arg("cutoff"),
@@ -80,8 +81,9 @@ BOOST_PYTHON_MODULE(_clustering) {
     "fused_butina",
     +[](const boost::python::dict& fingerprints,
         const double               cutoff,
+        const bool                 returnCentroids,
         const std::string&         metric,
-        std::uintptr_t             streamPtr) -> boost::python::tuple {
+        std::uintptr_t             streamPtr) -> boost::python::object {
       auto streamOpt = nvMolKit::acquireExternalStream(streamPtr);
       if (!streamOpt) {
         throw std::invalid_argument("Invalid CUDA stream");
@@ -106,23 +108,12 @@ BOOST_PYTHON_MODULE(_clustering) {
         throw std::invalid_argument("metric must be one of ['tanimoto', 'cosine']");
       }
 
-      auto                result = nvMolKit::fusedButinaGpu(span, n, numWords, cutoff, parsedMetric, stream);
-      boost::python::list members;
-      boost::python::list offsets;
-      boost::python::list centroids;
-      for (const int value : result.clusterMembers) {
-        members.append(value);
-      }
-      for (const int value : result.clusterOffsets) {
-        offsets.append(value);
-      }
-      for (const int value : result.centroids) {
-        centroids.append(value);
-      }
-      return boost::python::make_tuple(members, offsets, centroids);
+      auto result = nvMolKit::fusedButinaGpu(span, n, numWords, cutoff, parsedMetric, returnCentroids, stream);
+      return wrapButinaResult(result, n, returnCentroids);
     },
     (boost::python::arg("fingerprints"),
      boost::python::arg("cutoff"),
-     boost::python::arg("metric") = "tanimoto",
-     boost::python::arg("stream") = 0));
+     boost::python::arg("return_centroids") = false,
+     boost::python::arg("metric")           = "tanimoto",
+     boost::python::arg("stream")           = 0));
 };

@@ -24,21 +24,12 @@ import torch
 
 from nvmolkit import _DataStructs
 from nvmolkit._arrayHelpers import *  # noqa: F403
-from nvmolkit.types import ArrayInput, AsyncGpuResult, _as_cuda_tensor, _resolve_cuda_stream
+from nvmolkit._fingerprint_inputs import _prepare_packed_fingerprints
+from nvmolkit.types import ArrayInput, AsyncGpuResult
 
 # --------------------------------
 # Tanimoto similarity
 # --------------------------------
-
-
-def _check_fingerprint_input(name: str, x: torch.Tensor) -> torch.Tensor:
-    if x.ndim != 2:
-        raise ValueError(f"{name} must be 2D, got shape={tuple(x.shape)}")
-    if x.dtype not in (torch.int32, torch.uint32):
-        raise ValueError(f"{name} must have dtype int32 or uint32")
-    if not x.is_contiguous():
-        x = x.contiguous()
-    return x
 
 
 def _fingerprint_inputs(
@@ -46,21 +37,16 @@ def _fingerprint_inputs(
     fingerprint_group_two: ArrayInput | None,
     stream: torch.cuda.Stream | None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.cuda.Stream]:
-    active_stream = (
-        _resolve_cuda_stream(stream, fingerprint_group_one, fingerprint_group_two)
-        if fingerprint_group_two is not None
-        else _resolve_cuda_stream(stream, fingerprint_group_one)
-    )
-    with torch.cuda.stream(active_stream):
-        bits_one = _as_cuda_tensor("fingerprint_group_one", fingerprint_group_one, stream=active_stream)
-        bits_one = _check_fingerprint_input("fingerprint_group_one", bits_one)
-        bits_two = (
-            bits_one
-            if fingerprint_group_two is None
-            else _check_fingerprint_input(
-                "fingerprint_group_two",
-                _as_cuda_tensor("fingerprint_group_two", fingerprint_group_two, stream=active_stream),
-            )
+    if fingerprint_group_two is None:
+        (bits_one,), active_stream = _prepare_packed_fingerprints(
+            ("fingerprint_group_one", fingerprint_group_one), stream=stream
+        )
+        bits_two = bits_one
+    else:
+        (bits_one, bits_two), active_stream = _prepare_packed_fingerprints(
+            ("fingerprint_group_one", fingerprint_group_one),
+            ("fingerprint_group_two", fingerprint_group_two),
+            stream=stream,
         )
     if bits_one.shape[1] != bits_two.shape[1]:
         raise ValueError("fingerprint_group_one and fingerprint_group_two must have the same feature dimension")
@@ -93,11 +79,12 @@ def crossTanimotoSimilarity(
         similarity within fingerprint_group_one.
     """
     bits_one, bits_two, active_stream = _fingerprint_inputs(fingerprint_group_one, fingerprint_group_two, stream)
-    result = AsyncGpuResult(
-        _DataStructs.CrossTanimotoSimilarityRawBuffers(
-            bits_one.__cuda_array_interface__, bits_two.__cuda_array_interface__, active_stream.cuda_stream
+    with torch.cuda.stream(active_stream):
+        result = AsyncGpuResult(
+            _DataStructs.CrossTanimotoSimilarityRawBuffers(
+                bits_one.__cuda_array_interface__, bits_two.__cuda_array_interface__, active_stream.cuda_stream
+            )
         )
-    )
     result._input_refs = (bits_one, bits_two)
     return result
 
@@ -125,10 +112,10 @@ def crossTanimotoSimilarityMemoryConstrained(
         A numpy array of Tanimoto similarities, with index [i, j] corresponding to the similarity between
     """
     bits_one, bits_two, active_stream = _fingerprint_inputs(fingerprint_group_one, fingerprint_group_two, None)
-    active_stream.synchronize()
-    vals = _DataStructs.CrossTanimotoSimilarityCPURawBuffers(
-        bits_one.__cuda_array_interface__, bits_two.__cuda_array_interface__
-    )
+    with torch.cuda.stream(active_stream):
+        vals = _DataStructs.CrossTanimotoSimilarityCPURawBuffers(
+            bits_one.__cuda_array_interface__, bits_two.__cuda_array_interface__, active_stream.cuda_stream
+        )
     # vals is a numpy ndarray with shape (N, M)
     return vals
 
@@ -162,11 +149,12 @@ def crossCosineSimilarity(
         fingerprint i in fingerprint_group_one and fingerprint j in fingerprint_group_two.
     """
     bits_one, bits_two, active_stream = _fingerprint_inputs(fingerprint_group_one, fingerprint_group_two, stream)
-    result = AsyncGpuResult(
-        _DataStructs.CrossCosineSimilarityRawBuffers(
-            bits_one.__cuda_array_interface__, bits_two.__cuda_array_interface__, active_stream.cuda_stream
+    with torch.cuda.stream(active_stream):
+        result = AsyncGpuResult(
+            _DataStructs.CrossCosineSimilarityRawBuffers(
+                bits_one.__cuda_array_interface__, bits_two.__cuda_array_interface__, active_stream.cuda_stream
+            )
         )
-    )
     result._input_refs = (bits_one, bits_two)
     return result
 
@@ -194,8 +182,8 @@ def crossCosineSimilarityMemoryConstrained(
         A numpy array of Cosine similarities, with index [i, j] corresponding to the similarity between
     """
     bits_one, bits_two, active_stream = _fingerprint_inputs(fingerprint_group_one, fingerprint_group_two, None)
-    active_stream.synchronize()
-    vals = _DataStructs.CrossCosineSimilarityCPURawBuffers(
-        bits_one.__cuda_array_interface__, bits_two.__cuda_array_interface__
-    )
+    with torch.cuda.stream(active_stream):
+        vals = _DataStructs.CrossCosineSimilarityCPURawBuffers(
+            bits_one.__cuda_array_interface__, bits_two.__cuda_array_interface__, active_stream.cuda_stream
+        )
     return vals

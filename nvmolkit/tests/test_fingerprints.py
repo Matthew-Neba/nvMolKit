@@ -31,6 +31,7 @@ def test_roundtrip_pack_unpack():
     packed = pack_fingerprint(test_fp)
     assert packed.shape == (n_fps, fp_size // 32)
     assert packed.device.type == "cuda"
+    assert packed.dtype == torch.uint32
 
     # Unpack it
     unpacked = unpack_fingerprint(packed)
@@ -84,6 +85,7 @@ def test_nvmolkit_morgan_fingerprint(size_limited_mols, fpSize, radius):
     nvmolkit_fps_torch = nvmolkit_fpgen.GetFingerprints(size_limited_mols).torch()
     torch.cuda.synchronize()
     assert nvmolkit_fps_torch.device.type == "cuda"
+    assert nvmolkit_fps_torch.dtype == torch.uint32
     want_n_rows = len(size_limited_mols)
     want_n_cols = fpSize / 32
     assert nvmolkit_fps_torch.shape == (want_n_rows, want_n_cols)

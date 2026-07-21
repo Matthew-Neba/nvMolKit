@@ -89,9 +89,8 @@ target_include_directories(_embedMolecules SYSTEM PUBLIC ${Boost_INCLUDE_DIRS})
 installpythontarget(_embedMolecules ./)
 
 add_library(_clustering MODULE clustering.cpp)
-target_link_libraries(
-  _clustering PUBLIC ${Boost_LIBRARIES} ${PYTHON_LIBRARIES} device_vector
-                     butina fused_butina device)
+target_link_libraries(_clustering PUBLIC ${Boost_LIBRARIES} ${PYTHON_LIBRARIES}
+                                         device_vector butina device)
 target_include_directories(_clustering PUBLIC ${Boost_INCLUDE_DIRS}
                                               ${Python_INCLUDE_DIRS})
 installpythontarget(_clustering ./)
