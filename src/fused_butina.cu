@@ -23,17 +23,11 @@
 namespace nvMolKit {
 namespace {
 
-// TODO: Profile cuda::memcpy_async (cp.async) for staging fingerprint word tiles in shared memory during the initial
-// all-pairs count. Keep the current synchronous loads unless asynchronous copies provide a measurable speedup.
-//
 // ! Only supports fingerprinted clustering distance/similarity metrics and only for Tanimoto and Cosine similary
 // currently
 
 namespace cg = cooperative_groups;
 
-// Launch geometry is kept explicit because the initial all-pairs pass and the iterative row kernels have different
-// access patterns. The pair kernel assigns one candidate fingerprint to each thread, while the row kernels assign one
-// fingerprint to each thread.
 constexpr int kInitialArgMaxBlockSize = 256;
 constexpr int kCandidateTileSize      = 128;
 constexpr int kWordTileSize           = 8;

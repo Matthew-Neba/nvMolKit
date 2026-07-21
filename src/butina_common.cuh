@@ -14,7 +14,8 @@
 
 namespace nvMolKit {
 
-// Pack a neighbor count and point index so an unsigned maximum prefers higher counts, then higher indices.
+// Pack a neighbor count and point index so an unsigned maximum prefers higher counts, then higher indices. (Later we
+// will make the reordering = true path use this and the next helper)
 __device__ __forceinline__ std::uint64_t makeButinaCandidate(const int value, const int index) {
   if (value < 0) {
     return 0;

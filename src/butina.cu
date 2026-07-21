@@ -31,8 +31,8 @@
 
 /**
  * TODO: reordering=true butina standardization
- * - Align the non-fused reordering=true path with the other butina implementations and RDKit: 
- * 1) select the higher-index argmax each iteration
+ * - Align the non-fused reordering=true path with the other butina implementations and RDKit:
+ * 1) select the higher-index argmax (on ties) for each iteration
  * 2) and keep selection-order cluster IDs instead of renumbering clusters by final size.
  */
 namespace nvMolKit {
