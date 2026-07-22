@@ -215,3 +215,27 @@ The final full CUDA call is 1.58x, 1.82x, 1.90x, 1.78x, and 2.10x faster than
 the historical Triton initial-count kernel alone at those sizes on the RTX
 2050 proxy. These are same-GPU measurements; the supplied 5080 baseline must be
 rerun on that hardware before claiming its production speedup.
+
+## Iteration 6: width-independent chunked 64x64 tiles
+
+The whole-fingerprint tile cannot support arbitrary fingerprint widths because
+its shared-memory use grows with `numWords`. Replaced the temporary width error
+with a second optimized 64x64 symmetric kernel that streams words through fixed
+32-word shared-memory chunks. It processes one 32-column group at a time, so
+each thread retains eight intersections while preserving upper-triangular pair
+evaluation, bitcount sorting/pruning, padded shared rows, ballot hit masks, and
+original-index degree accumulation. Its static shared footprint is about
+13 KiB, independent of fingerprint width; it is not the old row kernel.
+
+At N=10k with seeded random fingerprints and cutoff 0.35:
+
+| Width | Chunked CUDA full call | Historical Triton initial count | CUDA advantage |
+|---:|---:|---:|---:|
+| 256 words / 8192 bits | 57.137 ms | 142.596 ms | 2.50x |
+| 512 words / 16384 bits | 102.686 ms | 287.940 ms | 2.80x |
+
+Nsight Compute on the 256-word kernel reports 57.53 ms, 47 registers/thread,
+83.03% achieved occupancy, 97.98% compute and 98.02% L1/TEX throughput, versus
+25.77% DRAM throughput. The kernel is execution/shared-traffic limited rather
+than occupancy or external-memory limited. Correctness passed with a restored
+256-word case (44/44 C++ and 23/23 fused Python tests).
