@@ -187,12 +187,12 @@ GPU kernel time) to the initial count. Fingerprint bit counting takes 0.063 ms,
 the four radix-sort passes total 0.044 ms, initial argmax takes 0.046 ms, and
 singleton output takes 0.824 ms. Raw profiler reports were deleted afterward.
 
-To avoid narrowing the API for unusually wide fingerprints, the launcher first
-uses the portable 48 KiB dynamic-shared-memory limit, then queries and opts into
-the active GPU's larger per-block limit when available. Only inputs whose tile
-exceeds that device-specific limit use the original small-shared-memory row
-kernel. A 256-word fused correctness case exercises this fallback on the 2050;
-high-end GPUs can retain tiling for wider inputs when their shared memory allows.
+The launcher uses the portable 48 KiB dynamic-shared-memory limit first, then
+queries and opts into the active GPU's larger per-block limit when needed. Per
+the target deployment assumptions, the slower row fallback was removed: an
+input whose whole-fingerprint tile exceeds the device-specific limit now fails
+with a clear error. The RTX 2050 supports the fast path for the tested 32- and
+64-word fingerprints; high-end GPUs can support correspondingly wider inputs.
 
 The primary cutoff-0.35 end-to-end improvement for this iteration is 1.08%,
 below the requested 2% stopping condition. Further optimization would need a

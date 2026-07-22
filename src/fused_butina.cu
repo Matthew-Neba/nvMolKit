@@ -33,8 +33,6 @@ constexpr int         kInitialArgMaxBlockSize       = 256;
 constexpr int         kInitialTileSize              = 64;
 constexpr int         kInitialBlockSize             = 256;
 constexpr int         kInitialColumnGroups          = kInitialTileSize / 32;
-constexpr int         kFallbackCandidateTileSize    = 128;
-constexpr int         kFallbackWordTileSize         = 8;
 constexpr int         kIterationBlockSize           = 128;
 constexpr std::size_t kPortableSharedMemoryPerBlock = 48 * 1024;
 
@@ -71,62 +69,6 @@ __global__ void fingerprintBitCountKernel(const cuda::std::span<const std::uint3
   }
   bitCounts[row]       = bitCount;
   originalIndices[row] = row;
-}
-
-// Preserve support for fingerprints too wide for the faster kernel's whole-fingerprint shared-memory tiles.
-template <FingerprintSimilarityMetric Metric>
-__global__ void initialNeighborCountFallbackKernel(const cuda::std::span<const std::uint32_t> fingerprints,
-                                                   const cuda::std::span<const int>           bitCounts,
-                                                   const cuda::std::span<int>                 neighborCounts,
-                                                   int                                        numWords,
-                                                   float                                      threshold) {
-  const int n   = static_cast<int>(neighborCounts.size());
-  const int row = blockIdx.x;
-  if (row >= n) {
-    return;
-  }
-
-  __shared__ std::uint32_t centerWords[kFallbackWordTileSize];
-  __shared__ std::uint32_t candidateWords[kFallbackCandidateTileSize * kFallbackWordTileSize];
-  int                      localNeighborCount = 0;
-
-  for (int candidateStart = 0; candidateStart < n; candidateStart += kFallbackCandidateTileSize) {
-    const int candidateRow = candidateStart + threadIdx.x;
-    int       intersection = 0;
-    for (int wordStart = 0; wordStart < numWords; wordStart += kFallbackWordTileSize) {
-      if (threadIdx.x < kFallbackWordTileSize) {
-        const int word           = wordStart + threadIdx.x;
-        centerWords[threadIdx.x] = word < numWords ? fingerprints[static_cast<std::size_t>(row) * numWords + word] : 0;
-      }
-      for (int item = threadIdx.x; item < kFallbackCandidateTileSize * kFallbackWordTileSize; item += blockDim.x) {
-        const int tileRow    = item / kFallbackWordTileSize;
-        const int tileWord   = item % kFallbackWordTileSize;
-        const int sourceRow  = candidateStart + tileRow;
-        const int sourceWord = wordStart + tileWord;
-        candidateWords[item] = sourceRow < n && sourceWord < numWords ?
-                                 fingerprints[static_cast<std::size_t>(sourceRow) * numWords + sourceWord] :
-                                 0;
-      }
-      __syncthreads();
-      if (candidateRow < n) {
-        for (int word = 0; word < kFallbackWordTileSize; ++word) {
-          intersection += __popc(centerWords[word] & candidateWords[threadIdx.x * kFallbackWordTileSize + word]);
-        }
-      }
-      __syncthreads();
-    }
-    if (candidateRow < n) {
-      localNeighborCount +=
-        detail::fingerprintSimilarityAtLeast<Metric>(intersection, bitCounts[row], bitCounts[candidateRow], threshold);
-    }
-  }
-
-  __shared__ typename cub::BlockReduce<int, kFallbackCandidateTileSize>::TempStorage storage;
-  const int                                                                          neighborCount =
-    cub::BlockReduce<int, kFallbackCandidateTileSize>(storage).Reduce(localNeighborCount, cubSum());
-  if (threadIdx.x == 0) {
-    neighborCounts[row] = neighborCount;
-  }
 }
 
 // Compute the initial active-neighbor count without storing an N x N matrix. Each block evaluates one upper-triangular
@@ -508,22 +450,17 @@ ButinaResult fusedButinaGpuImpl(cuda::std::span<const std::uint32_t> fingerprint
                                           static_cast<int>(initialSharedBytes)));
     }
   }
-  if (useTiledInitialKernel) {
-    initialNeighborCountKernel<Metric>
-      <<<dim3(numInitialTiles, numInitialTiles), kInitialBlockSize, initialSharedBytes, stream>>>(fingerprints,
-                                                                                                  bitCountsSpan,
-                                                                                                  sortedBitCountsSpan,
-                                                                                                  sortedIndicesSpan,
-                                                                                                  neighborCountsSpan,
-                                                                                                  numWords,
-                                                                                                  threshold);
-  } else {
-    initialNeighborCountFallbackKernel<Metric><<<n, kFallbackCandidateTileSize, 0, stream>>>(fingerprints,
-                                                                                             bitCountsSpan,
-                                                                                             neighborCountsSpan,
-                                                                                             numWords,
-                                                                                             threshold);
+  if (!useTiledInitialKernel) {
+    throw std::invalid_argument("Fingerprint width exceeds the active GPU's shared-memory capacity");
   }
+  initialNeighborCountKernel<Metric>
+    <<<dim3(numInitialTiles, numInitialTiles), kInitialBlockSize, initialSharedBytes, stream>>>(fingerprints,
+                                                                                                bitCountsSpan,
+                                                                                                sortedBitCountsSpan,
+                                                                                                sortedIndicesSpan,
+                                                                                                neighborCountsSpan,
+                                                                                                numWords,
+                                                                                                threshold);
   cudaCheckError(cudaGetLastError());
   initialArgMaxKernel<<<1, kInitialArgMaxBlockSize, 0, stream>>>(neighborCountsSpan, maxValue.data(), maxIndex.data());
   cudaCheckError(cudaGetLastError());
