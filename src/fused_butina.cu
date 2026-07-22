@@ -36,7 +36,6 @@ constexpr int         kInitialColumnGroups          = kInitialTileSize / 32;
 constexpr int         kInitialWordChunkSize         = 32;
 constexpr int         kInitialRowsPerWarp           = kInitialTileSize / (kInitialBlockSize / 32);
 constexpr int         kIterationBlockSize           = 128;
-constexpr std::size_t kPortableSharedMemoryPerBlock = 48 * 1024;
 
 template <FingerprintSimilarityMetric Metric>
 __device__ __forceinline__ bool fingerprintsWithinThreshold(const std::uint32_t* lhs,
@@ -74,8 +73,8 @@ __global__ void fingerprintBitCountKernel(const cuda::std::span<const std::uint3
 }
 
 // Compute the initial active-neighbor count without storing an N x N matrix. Each block evaluates one upper-triangular
-// tile of the symmetric similarity matrix. Off-diagonal pairs are computed once and contribute to both endpoint
-// counts; fingerprints loaded into shared memory are reused by every pair in the tile.
+// 64x64 tile and streams fingerprints through fixed-size shared-memory chunks. Processing one 32-column group at a
+// time limits each thread to eight live intersection accumulators and keeps shared-memory use independent of width.
 template <FingerprintSimilarityMetric Metric>
 __global__ void initialNeighborCountKernel(const cuda::std::span<const std::uint32_t> fingerprints,
                                            const cuda::std::span<const int>           bitCounts,
@@ -84,110 +83,6 @@ __global__ void initialNeighborCountKernel(const cuda::std::span<const std::uint
                                            const cuda::std::span<int>                 neighborCounts,
                                            int                                        numWords,
                                            float                                      threshold) {
-  const int rowTile    = blockIdx.x;
-  const int columnTile = blockIdx.y;
-  if (columnTile < rowTile) {
-    return;
-  }
-
-  const int  n           = static_cast<int>(neighborCounts.size());
-  const int  rowStart    = rowTile * kInitialTileSize;
-  const int  columnStart = columnTile * kInitialTileSize;
-  const int  rowEnd      = min(rowStart + kInitialTileSize, n) - 1;
-  const bool allPairsFeasible =
-    detail::fingerprintSimilarityCanReach<Metric>(sortedBitCounts[0], sortedBitCounts[n - 1], threshold);
-  if (!allPairsFeasible && !detail::fingerprintSimilarityCanReach<Metric>(sortedBitCounts[rowEnd],
-                                                                          sortedBitCounts[columnStart],
-                                                                          threshold)) {
-    return;
-  }
-
-  extern __shared__ std::uint32_t sharedWords[];
-  const int                       sharedStride = numWords + 1;
-  std::uint32_t* const            rowWords     = sharedWords;
-  std::uint32_t* const            columnWords  = rowWords + kInitialTileSize * sharedStride;
-  std::uint32_t* const            hitMasks     = columnWords + kInitialTileSize * sharedStride;
-
-  const int wordsPerTile = kInitialTileSize * numWords;
-  for (int item = threadIdx.x; item < wordsPerTile; item += blockDim.x) {
-    const int tileRow        = item / numWords;
-    const int word           = item - tileRow * numWords;
-    const int row            = rowStart + tileRow;
-    const int column         = columnStart + tileRow;
-    const int originalRow    = row < n ? (allPairsFeasible ? row : sortedIndices[row]) : 0;
-    const int originalColumn = column < n ? (allPairsFeasible ? column : sortedIndices[column]) : 0;
-    rowWords[tileRow * sharedStride + word] =
-      row < n ? fingerprints[static_cast<std::size_t>(originalRow) * numWords + word] : 0;
-    columnWords[tileRow * sharedStride + word] =
-      column < n ? fingerprints[static_cast<std::size_t>(originalColumn) * numWords + word] : 0;
-  }
-  __syncthreads();
-
-  const int lane = threadIdx.x % warpSize;
-  const int warp = threadIdx.x / warpSize;
-  for (int rowInWarp = 0; rowInWarp < kInitialTileSize / (kInitialBlockSize / warpSize); ++rowInWarp) {
-    const int tileRow     = warp * (kInitialTileSize / (kInitialBlockSize / warpSize)) + rowInWarp;
-    const int row         = rowStart + tileRow;
-    const int rowBitCount = row < n ? (allPairsFeasible ? bitCounts[row] : sortedBitCounts[row]) : 0;
-    int       rowCount    = 0;
-    for (int columnGroup = 0; columnGroup < kInitialColumnGroups; ++columnGroup) {
-      const int  column         = columnStart + columnGroup * warpSize + lane;
-      const int  columnBitCount = column < n ? (allPairsFeasible ? bitCounts[column] : sortedBitCounts[column]) : 0;
-      const bool canReachThreshold =
-        row < n && column < n &&
-        (allPairsFeasible || detail::fingerprintSimilarityCanReach<Metric>(rowBitCount, columnBitCount, threshold));
-      int intersection = 0;
-      if (canReachThreshold) {
-        for (int word = 0; word < numWords; ++word) {
-          intersection += __popc(rowWords[tileRow * sharedStride + word] &
-                                 columnWords[(columnGroup * warpSize + lane) * sharedStride + word]);
-        }
-      }
-      const int isNeighbor =
-        canReachThreshold &&
-        detail::fingerprintSimilarityAtLeast<Metric>(intersection, rowBitCount, columnBitCount, threshold);
-      const std::uint32_t hitMask = __ballot_sync(0xffffffff, isNeighbor);
-      if (lane == 0) {
-        hitMasks[tileRow * kInitialColumnGroups + columnGroup] = hitMask;
-        rowCount += __popc(hitMask);
-      }
-    }
-    if (lane == 0) {
-      if (row < n) {
-        const int originalRow = allPairsFeasible ? row : sortedIndices[row];
-        atomicAdd(&neighborCounts[originalRow], rowCount);
-      }
-    }
-  }
-  __syncthreads();
-
-  // An off-diagonal tile also contributes its transposed counts. A diagonal tile already accumulated every row once.
-  if (columnTile != rowTile && threadIdx.x < kInitialTileSize) {
-    const int column      = columnStart + threadIdx.x;
-    int       columnCount = 0;
-    for (int tileRow = 0; tileRow < kInitialTileSize; ++tileRow) {
-      const int columnGroup = threadIdx.x / warpSize;
-      const int columnLane  = threadIdx.x % warpSize;
-      columnCount += (hitMasks[tileRow * kInitialColumnGroups + columnGroup] >> columnLane) & 1U;
-    }
-    if (column < n) {
-      const int originalColumn = allPairsFeasible ? column : sortedIndices[column];
-      atomicAdd(&neighborCounts[originalColumn], columnCount);
-    }
-  }
-}
-
-// Width-independent version of the symmetric tiled kernel. It retains the 64x64 pair tile while streaming
-// fingerprints through shared memory in 32-word chunks. Processing one 32-column group at a time limits each thread to
-// eight live intersection accumulators and keeps the static shared-memory footprint independent of fingerprint width.
-template <FingerprintSimilarityMetric Metric>
-__global__ void initialNeighborCountChunkedKernel(const cuda::std::span<const std::uint32_t> fingerprints,
-                                                  const cuda::std::span<const int>           bitCounts,
-                                                  const cuda::std::span<const int>           sortedBitCounts,
-                                                  const cuda::std::span<const int>           sortedIndices,
-                                                  const cuda::std::span<int>                 neighborCounts,
-                                                  int                                        numWords,
-                                                  float                                      threshold) {
   const int rowTile    = blockIdx.x;
   const int columnTile = blockIdx.y;
   if (columnTile < rowTile) {
@@ -561,42 +456,15 @@ ButinaResult fusedButinaGpuImpl(cuda::std::span<const std::uint32_t> fingerprint
                                                  sizeof(int) * 8,
                                                  stream));
   cudaCheckError(cudaMemsetAsync(neighborCountsSpan.data(), 0, neighborCountsSpan.size_bytes(), stream));
-  const int  numInitialTiles = (n + kInitialTileSize - 1) / kInitialTileSize;
-  const auto initialSharedBytes =
-    static_cast<std::size_t>(2 * kInitialTileSize * (numWords + 1) + kInitialTileSize * kInitialColumnGroups) *
-    sizeof(std::uint32_t);
-  bool useTiledInitialKernel = initialSharedBytes <= kPortableSharedMemoryPerBlock;
-  if (!useTiledInitialKernel) {
-    int device               = 0;
-    int maxOptInSharedMemory = 0;
-    cudaCheckError(cudaGetDevice(&device));
-    cudaCheckError(cudaDeviceGetAttribute(&maxOptInSharedMemory, cudaDevAttrMaxSharedMemoryPerBlockOptin, device));
-    useTiledInitialKernel = initialSharedBytes <= static_cast<std::size_t>(maxOptInSharedMemory);
-    if (useTiledInitialKernel) {
-      cudaCheckError(cudaFuncSetAttribute(initialNeighborCountKernel<Metric>,
-                                          cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                          static_cast<int>(initialSharedBytes)));
-    }
-  }
-  if (useTiledInitialKernel) {
-    initialNeighborCountKernel<Metric>
-      <<<dim3(numInitialTiles, numInitialTiles), kInitialBlockSize, initialSharedBytes, stream>>>(fingerprints,
-                                                                                                  bitCountsSpan,
-                                                                                                  sortedBitCountsSpan,
-                                                                                                  sortedIndicesSpan,
-                                                                                                  neighborCountsSpan,
-                                                                                                  numWords,
-                                                                                                  threshold);
-  } else {
-    initialNeighborCountChunkedKernel<Metric>
-      <<<dim3(numInitialTiles, numInitialTiles), kInitialBlockSize, 0, stream>>>(fingerprints,
-                                                                                 bitCountsSpan,
-                                                                                 sortedBitCountsSpan,
-                                                                                 sortedIndicesSpan,
-                                                                                 neighborCountsSpan,
-                                                                                 numWords,
-                                                                                 threshold);
-  }
+  const int numInitialTiles = (n + kInitialTileSize - 1) / kInitialTileSize;
+  initialNeighborCountKernel<Metric>
+    <<<dim3(numInitialTiles, numInitialTiles), kInitialBlockSize, 0, stream>>>(fingerprints,
+                                                                               bitCountsSpan,
+                                                                               sortedBitCountsSpan,
+                                                                               sortedIndicesSpan,
+                                                                               neighborCountsSpan,
+                                                                               numWords,
+                                                                               threshold);
   cudaCheckError(cudaGetLastError());
   initialArgMaxKernel<<<1, kInitialArgMaxBlockSize, 0, stream>>>(neighborCountsSpan, maxValue.data(), maxIndex.data());
   cudaCheckError(cudaGetLastError());
