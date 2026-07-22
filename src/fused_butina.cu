@@ -9,6 +9,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cub/block/block_reduce.cuh>
+#include <cub/device/device_radix_sort.cuh>
 #include <stdexcept>
 #include <utility>
 
@@ -40,6 +41,9 @@ __device__ __forceinline__ bool fingerprintsWithinThreshold(const std::uint32_t*
                                                             int                  rhsBitCount,
                                                             int                  numWords,
                                                             float                threshold) {
+  if (!detail::fingerprintSimilarityCanReach<Metric>(lhsBitCount, rhsBitCount, threshold)) {
+    return false;
+  }
   int intersection = 0;
   for (int word = 0; word < numWords; ++word) {
     intersection += __popc(lhs[word] & rhs[word]);
@@ -51,6 +55,7 @@ __device__ __forceinline__ bool fingerprintsWithinThreshold(const std::uint32_t*
 // Compute and save each fingerprint's set-bit count. Both similarity metrics reuse these counts over and over again.
 __global__ void fingerprintBitCountKernel(const cuda::std::span<const std::uint32_t> fingerprints,
                                           const cuda::std::span<int>                 bitCounts,
+                                          const cuda::std::span<int>                 originalIndices,
                                           int                                        numWords) {
   const int row = blockIdx.x * blockDim.x + threadIdx.x;
   if (row >= static_cast<int>(bitCounts.size())) {
@@ -60,7 +65,8 @@ __global__ void fingerprintBitCountKernel(const cuda::std::span<const std::uint3
   for (int word = 0; word < numWords; ++word) {
     bitCount += __popc(fingerprints[static_cast<std::size_t>(row) * numWords + word]);
   }
-  bitCounts[row] = bitCount;
+  bitCounts[row]       = bitCount;
+  originalIndices[row] = row;
 }
 
 // Compute the initial active-neighbor count without storing an N x N matrix. Each block evaluates one upper-triangular
@@ -69,6 +75,8 @@ __global__ void fingerprintBitCountKernel(const cuda::std::span<const std::uint3
 template <FingerprintSimilarityMetric Metric>
 __global__ void initialNeighborCountKernel(const cuda::std::span<const std::uint32_t> fingerprints,
                                            const cuda::std::span<const int>           bitCounts,
+                                           const cuda::std::span<const int>           sortedBitCounts,
+                                           const cuda::std::span<const int>           sortedIndices,
                                            const cuda::std::span<int>                 neighborCounts,
                                            int                                        numWords,
                                            float                                      threshold) {
@@ -78,9 +86,17 @@ __global__ void initialNeighborCountKernel(const cuda::std::span<const std::uint
     return;
   }
 
-  const int n           = static_cast<int>(neighborCounts.size());
-  const int rowStart    = rowTile * kInitialTileSize;
-  const int columnStart = columnTile * kInitialTileSize;
+  const int  n           = static_cast<int>(neighborCounts.size());
+  const int  rowStart    = rowTile * kInitialTileSize;
+  const int  columnStart = columnTile * kInitialTileSize;
+  const int  rowEnd      = min(rowStart + kInitialTileSize, n) - 1;
+  const bool allPairsFeasible =
+    detail::fingerprintSimilarityCanReach<Metric>(sortedBitCounts[0], sortedBitCounts[n - 1], threshold);
+  if (!allPairsFeasible && !detail::fingerprintSimilarityCanReach<Metric>(sortedBitCounts[rowEnd],
+                                                                          sortedBitCounts[columnStart],
+                                                                          threshold)) {
+    return;
+  }
 
   extern __shared__ std::uint32_t sharedWords[];
   const int                       sharedStride = numWords + 1;
@@ -90,37 +106,45 @@ __global__ void initialNeighborCountKernel(const cuda::std::span<const std::uint
 
   const int wordsPerTile = kInitialTileSize * numWords;
   for (int item = threadIdx.x; item < wordsPerTile; item += blockDim.x) {
-    const int tileRow = item / numWords;
-    const int word    = item - tileRow * numWords;
-    const int row     = rowStart + tileRow;
-    const int column  = columnStart + tileRow;
+    const int tileRow        = item / numWords;
+    const int word           = item - tileRow * numWords;
+    const int row            = rowStart + tileRow;
+    const int column         = columnStart + tileRow;
+    const int originalRow    = row < n ? (allPairsFeasible ? row : sortedIndices[row]) : 0;
+    const int originalColumn = column < n ? (allPairsFeasible ? column : sortedIndices[column]) : 0;
     rowWords[tileRow * sharedStride + word] =
-      row < n ? fingerprints[static_cast<std::size_t>(row) * numWords + word] : 0;
+      row < n ? fingerprints[static_cast<std::size_t>(originalRow) * numWords + word] : 0;
     columnWords[tileRow * sharedStride + word] =
-      column < n ? fingerprints[static_cast<std::size_t>(column) * numWords + word] : 0;
+      column < n ? fingerprints[static_cast<std::size_t>(originalColumn) * numWords + word] : 0;
   }
   __syncthreads();
 
   const int lane = threadIdx.x % warpSize;
   const int warp = threadIdx.x / warpSize;
   for (int rowInWarp = 0; rowInWarp < kInitialTileSize / (kInitialBlockSize / warpSize); ++rowInWarp) {
-    const int tileRow      = warp * (kInitialTileSize / (kInitialBlockSize / warpSize)) + rowInWarp;
-    const int row          = rowStart + tileRow;
-    const int column       = columnStart + lane;
-    int       intersection = 0;
-    if (row < n && column < n) {
+    const int  tileRow        = warp * (kInitialTileSize / (kInitialBlockSize / warpSize)) + rowInWarp;
+    const int  row            = rowStart + tileRow;
+    const int  column         = columnStart + lane;
+    const int  rowBitCount    = row < n ? (allPairsFeasible ? bitCounts[row] : sortedBitCounts[row]) : 0;
+    const int  columnBitCount = column < n ? (allPairsFeasible ? bitCounts[column] : sortedBitCounts[column]) : 0;
+    const bool canReachThreshold =
+      row < n && column < n &&
+      (allPairsFeasible || detail::fingerprintSimilarityCanReach<Metric>(rowBitCount, columnBitCount, threshold));
+    int intersection = 0;
+    if (canReachThreshold) {
       for (int word = 0; word < numWords; ++word) {
         intersection += __popc(rowWords[tileRow * sharedStride + word] & columnWords[lane * sharedStride + word]);
       }
     }
     const int isNeighbor =
-      row < n && column < n &&
-      detail::fingerprintSimilarityAtLeast<Metric>(intersection, bitCounts[row], bitCounts[column], threshold);
+      canReachThreshold &&
+      detail::fingerprintSimilarityAtLeast<Metric>(intersection, rowBitCount, columnBitCount, threshold);
     const std::uint32_t hitMask = __ballot_sync(0xffffffff, isNeighbor);
     if (lane == 0) {
       hitMasks[tileRow] = hitMask;
       if (row < n) {
-        atomicAdd(&neighborCounts[row], __popc(hitMask));
+        const int originalRow = allPairsFeasible ? row : sortedIndices[row];
+        atomicAdd(&neighborCounts[originalRow], __popc(hitMask));
       }
     }
   }
@@ -134,7 +158,8 @@ __global__ void initialNeighborCountKernel(const cuda::std::span<const std::uint
       columnCount += (hitMasks[tileRow] >> threadIdx.x) & 1U;
     }
     if (column < n) {
-      atomicAdd(&neighborCounts[column], columnCount);
+      const int originalColumn = allPairsFeasible ? column : sortedIndices[column];
+      atomicAdd(&neighborCounts[originalColumn], columnCount);
     }
   }
 }
@@ -342,6 +367,9 @@ ButinaResult fusedButinaGpuImpl(cuda::std::span<const std::uint32_t> fingerprint
   // All (non scalar) buffers are O(N). Fingerprints remain in caller-owned storage and no pairwise matrix is allocated.
   const int              numIterationBlocks = (n + kIterationBlockSize - 1) / kIterationBlockSize;
   AsyncDeviceVector<int> bitCounts(n, stream);
+  AsyncDeviceVector<int> sortedBitCounts(n, stream);
+  AsyncDeviceVector<int> originalIndices(n, stream);
+  AsyncDeviceVector<int> sortedIndices(n, stream);
   AsyncDeviceVector<int> neighborCounts(n, stream);
   AsyncDeviceVector<int> clusterMembers(n, stream);
   ButinaResult result{AsyncDeviceVector<int>(n, stream), AsyncDeviceVector<int>(returnCentroids ? n : 0, stream), 0};
@@ -352,12 +380,15 @@ ButinaResult fusedButinaGpuImpl(cuda::std::span<const std::uint32_t> fingerprint
   AsyncDevicePtr<int>              maxValue(-1, stream);
   AsyncDevicePtr<int>              maxIndex(-1, stream);
 
-  const auto bitCountsSpan      = toSpan(bitCounts);
-  const auto neighborCountsSpan = toSpan(neighborCounts);
-  const auto clusterMembersSpan = toSpan(clusterMembers);
-  const auto clusterIdsSpan     = toSpan(result.clusterIds);
-  const auto centroidsSpan      = returnCentroids ? toSpan(result.centroids) : cuda::std::span<int>{};
-  const auto blockMaximaSpan    = toSpan(blockMaxima);
+  const auto bitCountsSpan       = toSpan(bitCounts);
+  const auto sortedBitCountsSpan = toSpan(sortedBitCounts);
+  const auto originalIndicesSpan = toSpan(originalIndices);
+  const auto sortedIndicesSpan   = toSpan(sortedIndices);
+  const auto neighborCountsSpan  = toSpan(neighborCounts);
+  const auto clusterMembersSpan  = toSpan(clusterMembers);
+  const auto clusterIdsSpan      = toSpan(result.clusterIds);
+  const auto centroidsSpan       = returnCentroids ? toSpan(result.centroids) : cuda::std::span<int>{};
+  const auto blockMaximaSpan     = toSpan(blockMaxima);
 
   cudaCheckError(cudaMemsetAsync(clusterIdsSpan.data(), 0xff, clusterIdsSpan.size_bytes(), stream));
 
@@ -365,8 +396,31 @@ ButinaResult fusedButinaGpuImpl(cuda::std::span<const std::uint32_t> fingerprint
   fingerprintBitCountKernel<<<(n + kIterationBlockSize - 1) / kIterationBlockSize, kIterationBlockSize, 0, stream>>>(
     fingerprints,
     bitCountsSpan,
+    originalIndicesSpan,
     numWords);
   cudaCheckError(cudaGetLastError());
+  std::size_t sortStorageBytes = 0;
+  cudaCheckError(cub::DeviceRadixSort::SortPairs(nullptr,
+                                                 sortStorageBytes,
+                                                 bitCountsSpan.data(),
+                                                 sortedBitCountsSpan.data(),
+                                                 originalIndicesSpan.data(),
+                                                 sortedIndicesSpan.data(),
+                                                 n,
+                                                 0,
+                                                 sizeof(int) * 8,
+                                                 stream));
+  AsyncDeviceVector<std::uint8_t> sortStorage(sortStorageBytes, stream);
+  cudaCheckError(cub::DeviceRadixSort::SortPairs(sortStorage.data(),
+                                                 sortStorageBytes,
+                                                 bitCountsSpan.data(),
+                                                 sortedBitCountsSpan.data(),
+                                                 originalIndicesSpan.data(),
+                                                 sortedIndicesSpan.data(),
+                                                 n,
+                                                 0,
+                                                 sizeof(int) * 8,
+                                                 stream));
   cudaCheckError(cudaMemsetAsync(neighborCountsSpan.data(), 0, neighborCountsSpan.size_bytes(), stream));
   const int  numInitialTiles = (n + kInitialTileSize - 1) / kInitialTileSize;
   const auto initialSharedBytes =
@@ -374,6 +428,8 @@ ButinaResult fusedButinaGpuImpl(cuda::std::span<const std::uint32_t> fingerprint
   initialNeighborCountKernel<Metric>
     <<<dim3(numInitialTiles, numInitialTiles), kInitialBlockSize, initialSharedBytes, stream>>>(fingerprints,
                                                                                                 bitCountsSpan,
+                                                                                                sortedBitCountsSpan,
+                                                                                                sortedIndicesSpan,
                                                                                                 neighborCountsSpan,
                                                                                                 numWords,
                                                                                                 threshold);

@@ -53,6 +53,24 @@ __device__ __forceinline__ Real fingerprintSimilarity(const int intersection,
 }
 
 template <FingerprintSimilarityMetric Metric>
+__device__ __forceinline__ bool fingerprintSimilarityCanReach(const int   lhsBitCount,
+                                                              const int   rhsBitCount,
+                                                              const float threshold) {
+  const int minBitCount = lhsBitCount < rhsBitCount ? lhsBitCount : rhsBitCount;
+  const int maxBitCount = lhsBitCount > rhsBitCount ? lhsBitCount : rhsBitCount;
+  if constexpr (Metric == FingerprintSimilarityMetric::Tanimoto) {
+    // The intersection cannot exceed the smaller population and the union cannot be smaller than the larger one.
+    return static_cast<float>(minBitCount) >= threshold * static_cast<float>(maxBitCount);
+  } else if constexpr (Metric == FingerprintSimilarityMetric::Cosine) {
+    // The maximum cosine similarity is sqrt(minBitCount / maxBitCount).
+    return static_cast<float>(minBitCount) >= threshold * threshold * static_cast<float>(maxBitCount);
+  } else {
+    static_assert(Metric == FingerprintSimilarityMetric::Tanimoto || Metric == FingerprintSimilarityMetric::Cosine,
+                  "Unsupported fingerprint similarity metric");
+  }
+}
+
+template <FingerprintSimilarityMetric Metric>
 __device__ __forceinline__ bool fingerprintSimilarityAtLeast(const int   intersection,
                                                              const int   lhsBitCount,
                                                              const int   rhsBitCount,

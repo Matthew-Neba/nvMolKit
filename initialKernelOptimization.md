@@ -114,3 +114,49 @@ input, Triton takes 19.114 ms at 10k, 79.028 ms at 20k, and 317.672 ms at 40k.
 Iteration 2 is respectively 1.64x, 1.83x, and 1.92x faster when comparing its
 profiled/end-to-end times (the CUDA end-to-end number includes small additional
 setup, argmax, and singleton-output costs).
+
+## Iteration 3: population-count upper-bound rejection
+
+Before intersecting fingerprint words, reject pairs whose bit populations make
+the threshold mathematically unreachable. For Tanimoto the maximum possible
+similarity is `min(popA,popB) / max(popA,popB)`; for cosine it is the square
+root of that ratio. The same check is used by the initial, extraction, and
+neighbor-update comparisons.
+
+For the 9,999 valid molecules in `chembl_10k.smi`, the bound rejects 41.55% of
+pairs at threshold 0.65, 66.60% at 0.8, and 83.75% at 0.9. End-to-end results:
+
+| Cutoff | Iteration 2 | Iteration 3 | Improvement |
+|---:|---:|---:|---:|
+| 0.10 | 33.472 ms | 16.293 ms | 51.32% |
+| 0.20 | 61.860 ms | 33.534 ms | 45.79% |
+| 0.35 | 94.577 ms | 68.582 ms | 27.49% |
+
+The initial kernel alone only falls from approximately 11.67 ms to 11.28 ms at
+cutoff 0.35: mixed populations in a warp leave most word-loop instructions
+active. Later one-thread-per-row comparisons benefit directly, explaining the
+larger end-to-end gain. Correctness passed (44/44 C++ and 22/22 fused Python).
+
+## Iteration 4: bitcount-sorted tile rejection
+
+Radix-sort row indices by cached bit population on the GPU before the initial
+count. In sorted order, all feasible pairs form a band around the diagonal, so
+an entire 32x32 tile returns before loading fingerprints when its maximum left
+population cannot reach the threshold against its minimum right population.
+Neighbor counts are atomically accumulated at original row indices. If the
+global minimum/maximum prove all pairs feasible, the kernel adaptively retains
+the original contiguous traversal and omits the scalar bound checks.
+
+On ChEMBL, the cutoff-0.35 initial kernel falls from 11.28 ms to 7.24 ms (35.82%
+improvement). End-to-end results relative to iteration 3:
+
+| Cutoff | Iteration 3 | Iteration 4 | Improvement |
+|---:|---:|---:|---:|
+| 0.10 | 16.293 ms | 9.031 ms | 44.57% |
+| 0.20 | 33.534 ms | 28.958 ms | 13.65% |
+| 0.35 | 68.582 ms | 65.761 ms | 4.11% |
+
+Correctness again passed (44/44 C++ and 22/22 fused Python). Uniform-density
+random inputs take the adaptive all-pairs-feasible path; their timings remain
+noisy on the laptop GPU, while the profiler confirms the same full-tile kernel
+work plus the small one-time radix-sort overhead.
