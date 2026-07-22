@@ -296,6 +296,7 @@ def fused_butina_clusters(x, cutoff, metric="tanimoto", stream=None):
         (50, "tanimoto", 32),
         (100, "tanimoto", 64),
         (200, "tanimoto", 32),
+        (50, "tanimoto", 256),
         (50, "cosine", 32),
         (100, "cosine", 64),
         (200, "cosine", 32),

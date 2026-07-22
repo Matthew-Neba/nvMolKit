@@ -160,3 +160,58 @@ Correctness again passed (44/44 C++ and 22/22 fused Python). Uniform-density
 random inputs take the adaptive all-pairs-feasible path; their timings remain
 noisy on the laptop GPU, while the profiler confirms the same full-tile kernel
 work plus the small one-time radix-sort overhead.
+
+## Iteration 5: 64x64 tiles and stopping condition
+
+Expanded the initial tile from 32x32/128 threads to 64x64/256 threads. Each
+warp handles two 32-column groups per row and stores two ballot masks. This
+quarters the launched block count, halves endpoint atomics per pair, and
+doubles fingerprint reuse. The design is retained because those properties are
+particularly favorable to the target high-SM-count GPUs, even though the local
+2050 end-to-end result is near the stopping threshold.
+
+ChEMBL end-to-end results relative to iteration 4:
+
+| Cutoff | 32x32 | 64x64 | Improvement |
+|---:|---:|---:|---:|
+| 0.10 | 9.031 ms | 8.928 ms | 1.14% |
+| 0.20 | 28.958 ms | 27.852 ms | 3.82% |
+| 0.35 | 65.761 ms | 65.052 ms | 1.08% |
+
+At cutoff 0.35, Nsight Compute reports 6.92 ms for the initial kernel versus
+7.24 ms with 32x32 tiles (4.42% kernel improvement), 40 registers/thread,
+80.49% achieved occupancy, and 98.49% compute / 98.84% L1-TEX throughput.
+
+Nsight Systems on the final 40k random proxy attributes 165.514 ms (99.4% of
+GPU kernel time) to the initial count. Fingerprint bit counting takes 0.063 ms,
+the four radix-sort passes total 0.044 ms, initial argmax takes 0.046 ms, and
+singleton output takes 0.824 ms. Raw profiler reports were deleted afterward.
+
+To avoid narrowing the API for unusually wide fingerprints, the launcher first
+uses the portable 48 KiB dynamic-shared-memory limit, then queries and opts into
+the active GPU's larger per-block limit when available. Only inputs whose tile
+exceeds that device-specific limit use the original small-shared-memory row
+kernel. A 256-word fused correctness case exercises this fallback on the 2050;
+high-end GPUs can retain tiling for wider inputs when their shared memory allows.
+
+The primary cutoff-0.35 end-to-end improvement for this iteration is 1.08%,
+below the requested 2% stopping condition. Further optimization would need a
+different similarity representation or approximate/indexed neighbor search;
+exact arbitrary fingerprint degrees retain an O(N^2) worst case.
+
+## Final proxy summary
+
+For seeded random 1024-bit fingerprints at cutoff 0.35:
+
+| N | Original CUDA | Final CUDA | CUDA speedup | Historical Triton initial count |
+|---:|---:|---:|---:|---:|
+| 10k | 67.923 ms | 12.059 ms | 5.63x | 19.114 ms |
+| 20k | 265.123 ms | 43.311 ms | 6.12x | 79.028 ms |
+| 40k | 1063.864 ms | 167.468 ms | 6.35x | 317.672 ms |
+| 100k | not measured | 996.918 ms | - | 1777.359 ms |
+| 500k | not measured | 25.565 s | - | 53.731 s |
+
+The final full CUDA call is 1.58x, 1.82x, 1.90x, 1.78x, and 2.10x faster than
+the historical Triton initial-count kernel alone at those sizes on the RTX
+2050 proxy. These are same-GPU measurements; the supplied 5080 baseline must be
+rerun on that hardware before claiming its production speedup.
