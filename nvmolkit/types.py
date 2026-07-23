@@ -23,6 +23,7 @@ import torch
 
 from nvmolkit import _arrayHelpers  # noqa: F401
 from nvmolkit import _embedMolecules  # type: ignore
+from nvmolkit._types import FireOptions  # noqa: F401
 
 
 class HardwareOptions:
