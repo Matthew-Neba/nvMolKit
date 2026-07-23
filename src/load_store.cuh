@@ -215,7 +215,7 @@ __forceinline__ __device__ void ld_m16n8k256_x2(const uint32_t* smem_ptr,
  *
  * @tparam TILE_X The tile width in shared memory.
  * @tparam TILE_Y The tile height in shared memory.
- * @tparam Metric Fingerprint similarity metric used to normalize intersection counts.
+ * @tparam Metric Fingerprint similarity metric.
  *
  * @param regs_and Array of unsigned integers containing AND results.
  * @param regs_xor Array of unsigned integers containing XOR results.
