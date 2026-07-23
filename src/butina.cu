@@ -30,7 +30,7 @@
  */
 
 /**
- * TODO: reordering=true butina standardization
+ * TODO: Butina standardization (and make deterministic)
  * - Align the non-fused reordering=true path with the other butina implementations and RDKit:
  * 1) select the higher-index argmax (on ties) for each iteration
  * 2) and keep selection-order cluster IDs instead of renumbering clusters by final size.
@@ -836,8 +836,7 @@ __global__ void pruneNeighborlistKernel(const cuda::std::span<int> clusters,
 }
 
 //! Inner loop iteration for Butina clustering.
-void innerButinaLoop(const int                            numPoints,
-                     const cuda::std::span<const uint8_t> hitMatrix,
+void innerButinaLoop(const cuda::std::span<const uint8_t> hitMatrix,
                      const cuda::std::span<int>           clusters,
                      const cuda::std::span<int>           clusterSizesSpan,
                      const cuda::std::span<int>           centroids,
@@ -848,7 +847,7 @@ void innerButinaLoop(const int                            numPoints,
                      cudaStream_t                         stream) {
   const int numBlocksFlat = ((static_cast<int>(clusterSizesSpan.size()) - 1) / blockSizeCount) + 1;
 
-  butinaKernelCountClusterSize<<<numPoints, blockSizeCount, 0, stream>>>(hitMatrix, clusters, clusterSizesSpan);
+  butinaKernelCountClusterSize<<<clusters.size(), blockSizeCount, 0, stream>>>(hitMatrix, clusters, clusterSizesSpan);
   cudaCheckError(cudaGetLastError());
 
   argMaxRunner.captureOn(stream,
@@ -912,17 +911,15 @@ void innerButinaLoopWithPruning(const int                  numPoints,
  * This is called once before entering the pruning loop.
  */
 template <int NeighborlistMaxSize>
-void buildInitialNeighborlist(const int                            numPoints,
-                              const cuda::std::span<const uint8_t> hitMatrix,
+void buildInitialNeighborlist(const cuda::std::span<const uint8_t> hitMatrix,
                               const cuda::std::span<int>           clusters,
                               const cuda::std::span<int>           clusterSizesSpan,
                               const cuda::std::span<int>           neighborList,
                               cudaStream_t                         stream) {
   const ScopedNvtxRange range("Build initial neighborlist");
   butinaKernelCountClusterSizeWithNeighborlist<NeighborlistMaxSize>
-    <<<numPoints, blockSizeCount, 0, stream>>>(hitMatrix, clusters, clusterSizesSpan, neighborList);
+    <<<clusters.size(), blockSizeCount, 0, stream>>>(hitMatrix, clusters, clusterSizesSpan, neighborList);
   cudaCheckError(cudaGetLastError());
-  cudaCheckError(cudaStreamSynchronize(stream));
 }
 
 //! Run fixed-order Butina clustering for reordering=false.
@@ -996,7 +993,6 @@ template <int NeighborlistMaxSize>
   ScopedNvtxRange        setupRange("Butina Setup");
   const size_t           numPoints = clusters.size();
   AsyncDeviceVector<int> clusterSizes(clusters.size(), stream);
-  clusterSizes.zero();
   AsyncDeviceVector<int> neighborList(NeighborlistMaxSize * numPoints, stream);
   const auto             neighborListSpan = toSpan(neighborList);
 
@@ -1019,8 +1015,7 @@ template <int NeighborlistMaxSize>
   {
     ScopedNvtxRange            buildRange("Build inner loop graph with WHILE node");
     const ConditionalLoopGraph innerLoopGraph([&](cudaStream_t captureStream, cudaGraphConditionalHandle handle) {
-      innerButinaLoop(static_cast<int>(numPoints),
-                      hitMatrix,
+      innerButinaLoop(hitMatrix,
                       clusters,
                       clusterSizesSpan,
                       centroids,
@@ -1039,7 +1034,6 @@ template <int NeighborlistMaxSize>
     // Launch once - GPU executes all iterations until maxValue < threshold
     const ScopedNvtxRange loopRange("Large cluster Butina Loop (conditional WHILE graph)");
     innerLoopGraph.launch(stream);
-    cudaCheckError(cudaStreamSynchronize(stream));
 
     // Copy final maxValue to host for subsequent pruning loop
     cudaCheckError(cudaMemcpyAsync(maxCluster.data(), maxValue.data(), sizeof(int), cudaMemcpyDefault, stream));
@@ -1048,16 +1042,10 @@ template <int NeighborlistMaxSize>
 
   // Build neighborlist once, then prune dynamically using CUDA Graph with conditional WHILE node
   if (maxCluster[0] >= kMinLoopSizeForAssignment) {
-    buildInitialNeighborlist<NeighborlistMaxSize>(numPoints,
-                                                  hitMatrix,
-                                                  clusters,
-                                                  clusterSizesSpan,
-                                                  neighborListSpan,
-                                                  stream);
+    buildInitialNeighborlist<NeighborlistMaxSize>(hitMatrix, clusters, clusterSizesSpan, neighborListSpan, stream);
 
-    // Initial argmax to prime the loop (buildInitialNeighborlist already synced)
+    // Prime the first pruning-loop iteration. Stream ordering makes this result visible to the graph launch below.
     argMaxRunner(clusterSizesSpan.data(), maxValue.data(), maxIndex.data(), static_cast<int>(clusterSizesSpan.size()));
-    cudaCheckError(cudaStreamSynchronize(stream));
 
     // Use CUDA Graph with conditional WHILE node for fully GPU-side pruning loop control
     ScopedNvtxRange            buildRange("Build pruning loop graph with WHILE node");

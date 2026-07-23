@@ -72,9 +72,13 @@ __global__ void fingerprintBitCountKernel(const cuda::std::span<const std::uint3
   originalIndices[row] = row;
 }
 
-// Compute the initial active-neighbor count without storing an N x N matrix. Each block evaluates one upper-triangular
-// 64x64 tile and streams fingerprints through fixed-size shared-memory chunks. Processing one 32-column group at a
-// time limits each thread to eight live intersection accumulators and keeps shared-memory use independent of width.
+// Build the initial neighbor counts without storing an N x N matrix. Each 256-thread block handles one upper-triangular
+// 64x64 tile. Sorted bit counts help to cheaply reject impossible tiles and pairs because max Tanimoto = min(a, b) /
+// max(a, b) and max cosine = sqrt(min(a, b) / max(a, b)). Eight warps cover the 64 rows, with 8 rows handled per warp
+// (8 * 32 = 256 threads). Within each warp, its 32 lanes handle 32 columns at a time. All eight warps process their
+// rows in parallel, then reuse their lanes for the other 32 columns. Fingerprint words are loaded into shared memory in
+// 32-word chunks. Each lane keeps eight intersections and ballots its neighbor decisions into hit masks. Counting those
+// masks produces the initial neighbor counts, then argmax chooses the first centroid.
 template <FingerprintSimilarityMetric Metric>
 __global__ void initialNeighborCountKernel(const cuda::std::span<const std::uint32_t> fingerprints,
                                            const cuda::std::span<const int>           bitCounts,
@@ -85,29 +89,43 @@ __global__ void initialNeighborCountKernel(const cuda::std::span<const std::uint
                                            float                                      threshold) {
   const int rowTile    = blockIdx.x;
   const int columnTile = blockIdx.y;
+
+  // Similarity is symmetric, so the lower half of the matrix would repeat work from the upper half. Compute each
+  // off-diagonal tile once and reuse its results to update the neighbor counts for both sides. Cuts work in half
   if (columnTile < rowTile) {
     return;
   }
 
-  const int  n           = static_cast<int>(neighborCounts.size());
-  const int  rowStart    = rowTile * kInitialTileSize;
-  const int  columnStart = columnTile * kInitialTileSize;
-  const int  rowEnd      = min(rowStart + kInitialTileSize, n) - 1;
+  const int n           = static_cast<int>(neighborCounts.size());
+  const int rowStart    = rowTile * kInitialTileSize;
+  const int columnStart = columnTile * kInitialTileSize;
+  const int rowEnd      = min(rowStart + kInitialTileSize, n) - 1;
+
+  // In an off-diagonal tile, rowEnd and columnStart are the closest bit counts, so they bound its best pair.
+  // In a diagonal tile they are the widest-separated counts, so the tile must not be pruned.
   const bool allPairsFeasible =
     detail::fingerprintSimilarityCanReach<Metric>(sortedBitCounts[0], sortedBitCounts[n - 1], threshold);
-  if (!allPairsFeasible && !detail::fingerprintSimilarityCanReach<Metric>(sortedBitCounts[rowEnd],
-                                                                          sortedBitCounts[columnStart],
-                                                                          threshold)) {
+  if (columnTile != rowTile && !allPairsFeasible &&
+      !detail::fingerprintSimilarityCanReach<Metric>(sortedBitCounts[rowEnd],
+                                                     sortedBitCounts[columnStart],
+                                                     threshold)) {
     return;
   }
 
+  // Pad each row by one word. The 33-word stride spreads lanes across shared-memory banks instead of making them
+  // contend for the same bank.
   __shared__ std::uint32_t rowWords[kInitialTileSize][kInitialWordChunkSize + 1];
   __shared__ std::uint32_t columnWords[32][kInitialWordChunkSize + 1];
   __shared__ std::uint32_t hitMasks[kInitialTileSize][kInitialColumnGroups];
 
-  const int lane = threadIdx.x % warpSize;
-  const int warp = threadIdx.x / warpSize;
+  // Each warp handles 8 of the 64 rows. Each lane handles one column.
+  const auto warpGroup = cg::tiled_partition<32>(cg::this_thread_block());
+  const int  lane      = static_cast<int>(warpGroup.thread_rank());
+  const int  warp      = threadIdx.x / warpSize;
+
+  // Handle 32 columns at a time, so two passes cover all 64 columns.
   for (int columnGroup = 0; columnGroup < kInitialColumnGroups; ++columnGroup) {
+    // Each lane compares its column against the warp's 8 rows and keeps one running intersection for each row.
     int       intersections[kInitialRowsPerWarp]{};
     bool      canReachThreshold[kInitialRowsPerWarp];
     const int column         = columnStart + columnGroup * warpSize + lane;
@@ -121,6 +139,7 @@ __global__ void initialNeighborCountKernel(const cuda::std::span<const std::uint
         (allPairsFeasible || detail::fingerprintSimilarityCanReach<Metric>(rowBitCount, columnBitCount, threshold));
     }
 
+    // Read 32 words at a time. Each chunk is added to the same running intersections.
     for (int wordStart = 0; wordStart < numWords; wordStart += kInitialWordChunkSize) {
       for (int item = threadIdx.x; item < kInitialTileSize * kInitialWordChunkSize; item += blockDim.x) {
         const int tileRow              = item / kInitialWordChunkSize;
@@ -132,6 +151,7 @@ __global__ void initialNeighborCountKernel(const cuda::std::span<const std::uint
                                            fingerprints[static_cast<std::size_t>(originalRow) * numWords + sourceWord] :
                                            0;
       }
+      // Cooperatively load the current 32-column word chunk into shared memory.
       for (int item = threadIdx.x; item < 32 * kInitialWordChunkSize; item += blockDim.x) {
         const int tileColumn     = item / kInitialWordChunkSize;
         const int wordInChunk    = item % kInitialWordChunkSize;
@@ -143,8 +163,10 @@ __global__ void initialNeighborCountKernel(const cuda::std::span<const std::uint
             fingerprints[static_cast<std::size_t>(originalColumn) * numWords + sourceWord] :
             0;
       }
+      // Wait until every shared row and column word is available.
       __syncthreads();
 
+      // Add this chunk to the running intersection for each row-column pair.
       for (int rowInWarp = 0; rowInWarp < kInitialRowsPerWarp; ++rowInWarp) {
         if (canReachThreshold[rowInWarp]) {
           const int tileRow = warp * kInitialRowsPerWarp + rowInWarp;
@@ -153,9 +175,11 @@ __global__ void initialNeighborCountKernel(const cuda::std::span<const std::uint
           }
         }
       }
+      // Wait until all threads finish reading shared memory before the next chunk overwrites it.
       __syncthreads();
     }
 
+    // Convert the accumulated intersections into one ballot mask per tile row.
     for (int rowInWarp = 0; rowInWarp < kInitialRowsPerWarp; ++rowInWarp) {
       const int tileRow     = warp * kInitialRowsPerWarp + rowInWarp;
       const int row         = rowStart + tileRow;
@@ -163,11 +187,14 @@ __global__ void initialNeighborCountKernel(const cuda::std::span<const std::uint
       const int isNeighbor =
         canReachThreshold[rowInWarp] &&
         detail::fingerprintSimilarityAtLeast<Metric>(intersections[rowInWarp], rowBitCount, columnBitCount, threshold);
-      const std::uint32_t hitMask = __ballot_sync(0xffffffff, isNeighbor);
+
+      // Pack the warp's 32 yes-or-no neighbor results into one mask.
+      const std::uint32_t hitMask = warpGroup.ballot(isNeighbor);
       if (lane == 0) {
         hitMasks[tileRow][columnGroup] = hitMask;
       }
     }
+    // Wait until every warp has stored its masks before the row and column reductions read them.
     __syncthreads();
   }
 
@@ -175,6 +202,7 @@ __global__ void initialNeighborCountKernel(const cuda::std::span<const std::uint
     const int row = rowStart + threadIdx.x;
     if (row < n) {
       int rowCount = 0;
+      // Count the set bits in both masks to get this row's neighbors.
       for (int columnGroup = 0; columnGroup < kInitialColumnGroups; ++columnGroup) {
         rowCount += __popc(hitMasks[threadIdx.x][columnGroup]);
       }
@@ -182,12 +210,14 @@ __global__ void initialNeighborCountKernel(const cuda::std::span<const std::uint
       atomicAdd(&neighborCounts[originalRow], rowCount);
     }
 
+    // Reuse the same masks for the transposed column counts, so off-diagonal pairs are not computed twice.
     if (columnTile != rowTile) {
       const int column = columnStart + threadIdx.x;
       if (column < n) {
         const int columnGroup = threadIdx.x / warpSize;
         const int columnLane  = threadIdx.x % warpSize;
         int       columnCount = 0;
+        // Read this column's bit from every row mask to get its neighbors.
         for (int tileRow = 0; tileRow < kInitialTileSize; ++tileRow) {
           columnCount += (hitMasks[tileRow][columnGroup] >> columnLane) & 1U;
         }
@@ -433,6 +463,8 @@ ButinaResult fusedButinaGpuImpl(cuda::std::span<const std::uint32_t> fingerprint
     originalIndicesSpan,
     numWords);
   cudaCheckError(cudaGetLastError());
+
+  // Sort bit counts and indices to skip impossible tiles/unnecessary work in the downstream kernels
   std::size_t sortStorageBytes = 0;
   cudaCheckError(cub::DeviceRadixSort::SortPairs(nullptr,
                                                  sortStorageBytes,
