@@ -4,14 +4,11 @@
 #include <cooperative_groups.h>
 #include <cuda_runtime.h>
 
-#include <algorithm>
-#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cub/block/block_reduce.cuh>
 #include <cub/device/device_radix_sort.cuh>
 #include <stdexcept>
-#include <utility>
 
 #include "src/butina.h"
 #include "src/butina_common.cuh"
@@ -24,18 +21,17 @@
 namespace nvMolKit {
 namespace {
 
-// ! Only supports fingerprinted clustering distance/similarity metrics and only for Tanimoto and Cosine similary
-// currently
+// Only fingerprint clustering with the Tanimoto and cosine similarity metrics is currently supported.
 
 namespace cg = cooperative_groups;
 
-constexpr int         kInitialArgMaxBlockSize       = 256;
-constexpr int         kInitialTileSize              = 64;
-constexpr int         kInitialBlockSize             = 256;
-constexpr int         kInitialColumnGroups          = kInitialTileSize / 32;
-constexpr int         kInitialWordChunkSize         = 32;
-constexpr int         kInitialRowsPerWarp           = kInitialTileSize / (kInitialBlockSize / 32);
-constexpr int         kIterationBlockSize           = 128;
+constexpr int kInitialArgMaxBlockSize = 256;
+constexpr int kInitialTileSize        = 64;
+constexpr int kInitialBlockSize       = 256;
+constexpr int kInitialColumnGroups    = kInitialTileSize / 32;
+constexpr int kInitialWordChunkSize   = 32;
+constexpr int kInitialRowsPerWarp     = kInitialTileSize / (kInitialBlockSize / 32);
+constexpr int kIterationBlockSize     = 128;
 
 template <FingerprintSimilarityMetric Metric>
 __device__ __forceinline__ bool fingerprintsWithinThreshold(const std::uint32_t* lhs,
@@ -264,8 +260,8 @@ __global__ void extractClusterKernel(const cuda::std::span<const std::uint32_t> 
     return;
   }
 
-  // Compare this active molecule with the selected centroid. Determine if thier fingerprints are within a similariy
-  // threshold
+  // Compare this active molecule with the selected centroid and test whether their fingerprints meet the similarity
+  // threshold.
   const int center = *maxIndex;
   if (!fingerprintsWithinThreshold<Metric>(fingerprints.data() + static_cast<std::size_t>(center) * numWords,
                                            fingerprints.data() + static_cast<std::size_t>(row) * numWords,
@@ -381,8 +377,7 @@ __global__ void selectNextCentroidKernel(const cuda::std::span<const std::uint64
   }
 }
 
-// Append all molecules left active after the graph loop as singleton clusters. (can optimize this later, but this
-// kernel usually takes less than 1% of execution time)
+// Append all molecules left active after the graph loop as singleton clusters.
 __global__ void appendSingletonsKernel(const cuda::std::span<int> clusterIds,
                                        int*                       clusterCount,
                                        const cuda::std::span<int> centroids) {
