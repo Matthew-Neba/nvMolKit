@@ -24,7 +24,6 @@ if TYPE_CHECKING:
     from rdkit.Chem import Mol
 
 from nvmolkit import _uffOptimization
-from nvmolkit._arrayHelpers import *  # noqa: F403  # registers PyArray for DEVICE-mode returns
 from nvmolkit.types import CoordinateOutput, Device3DResult, HardwareOptions
 
 

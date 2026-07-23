@@ -53,7 +53,7 @@ struct ButinaResult {
  *
  * Only Tanimoto and cosine similarity are supported. The distance cutoff is converted
  * to a similarity threshold of `1 - cutoff`. The result buffers remain in device
- * memory. The function synchronizes once to determine @ref ButinaResult::numClusters.
+ * memory.
  *
  * @param fingerprints Packed device array with @p numFingerprints entries of @p numWords words each.
  * @param numFingerprints Number of fingerprints in @p fingerprints.
@@ -79,10 +79,9 @@ ButinaResult fusedButinaGpu(cuda::std::span<const std::uint32_t> fingerprints,
  * thresholding at the specified cutoff, then performs Butina clustering. The
  * algorithm iteratively selects the item with the most unclustered neighbors
  * and forms clusters. Output buffers are allocated on the device and returned
- * to the caller.
+ * to the caller. The distance matrix is expected to be symmetric.
  *
- * The matrix is expected to be symmetric with diagonal values at or below the cutoff.
- * These properties are not validated.
+ *
  *
  * @param distanceMatrix Square NxN matrix where distanceMatrix[i*N+j] contains the distance between items i and j.
  * @param numPoints Number of items represented by the distance matrix.
@@ -109,15 +108,14 @@ ButinaResult butinaFromDistanceMatrix(cuda::std::span<const double> distanceMatr
  * whether items i and j are neighbors. It avoids allocating and thresholding a
  * floating-point distance matrix when neighbor relationships are already known.
  * Output buffers are allocated on the device and returned to the caller. The
- * matrix is expected to be symmetric with a nonzero diagonal; these properties
- * are not validated.
+ * matrix is expected to be symmetric with a nonzero diagonal.
  *
- * @param hitMatrix Binary NxN matrix where hitMatrix[i*N+j] is nonzero when items i and j are neighbors.
- * @param numPoints Number of items represented by the hit matrix.
- * @param neighborlistMaxSize Small-cluster neighbor-list capacity. Ignored when reordering is disabled.
- * @param returnCentroids Whether to return one centroid index per cluster.
- * @param reordering Whether to dynamically reorder candidates after each cluster assignment.
- * @param stream CUDA stream to execute operations on. Defaults to stream 0.
+ * @param hitMatrix Binary NxN neighbor matrix.
+ * @param numPoints Number of molecules.
+ * @param neighborlistMaxSize Small-cluster neighbor-list capacity; ignored when reordering is disabled.
+ * @param returnCentroids Whether to return cluster centroid indices.
+ * @param reordering Whether to update neighbor counts after each cluster assignment.
+ * @param stream CUDA stream; defaults to stream 0.
  * @return Device-owned cluster IDs, optional centroids, and the number of clusters.
  */
 ButinaResult butinaFromHitMatrix(cuda::std::span<const uint8_t> hitMatrix,

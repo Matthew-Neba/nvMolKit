@@ -15,10 +15,10 @@
 
 """Contains GPU-accelerated Butina clustering implementations.
 
-The standard ``butina()`` path precomputes a full N x N distance matrix and then
-clusters from it.  This is the right choice when you already have a distance
-matrix or plan to reuse it (e.g. at multiple cutoffs), and when N is small
-enough that the O(N^2) matrix fits comfortably in GPU memory.
+The standard ``butina()`` path accepts a full N x N distance matrix and
+materializes its neighbor relationships. This is the right choice when you
+already have a distance matrix or plan to reuse it (e.g. at multiple cutoffs),
+and when N is small enough that the O(N^2) data fits comfortably in GPU memory.
 
 ``fused_butina()`` avoids materializing the distance matrix entirely.  Each
 clustering round recomputes only the similarities it needs on the fly with
@@ -31,11 +31,10 @@ better choice for large N where the full matrix would be prohibitively large.
 import torch
 
 from nvmolkit import _clustering
-from nvmolkit._arrayHelpers import *  # noqa: F403
 from nvmolkit._fingerprint_inputs import _prepare_packed_fingerprints
 from nvmolkit.types import ArrayInput, AsyncGpuResult, _as_cuda_tensor, _resolve_cuda_stream
 
-_VALID_NEIGHBORLIST_SIZES = frozenset({8, 16, 24, 32, 64, 128})
+_VALID_NEIGHBORLIST_SIZES = (8, 16, 24, 32, 64, 128)
 
 
 def _wrap_result(result, return_centroids: bool):
@@ -80,7 +79,7 @@ def butina(
         neighborlist_max_size: Maximum size of the neighborlist used for small cluster
                               optimization. Must be 8, 16, 24, 32, 64, or 128. Larger values
                               allow parallel processing of larger clusters but use more
-                              shared memory.
+                              shared memory. Ignored when reordering is False.
         return_centroids: Whether to return centroid indices for each cluster.
         reordering: Whether to update neighbor counts among unassigned items
                     after each cluster is formed. Defaults to True, while
@@ -99,7 +98,7 @@ def butina(
     """
     if neighborlist_max_size not in _VALID_NEIGHBORLIST_SIZES:
         raise ValueError(
-            f"neighborlist_max_size must be one of {sorted(_VALID_NEIGHBORLIST_SIZES)}, got {neighborlist_max_size}"
+            f"neighborlist_max_size must be one of {_VALID_NEIGHBORLIST_SIZES}, got {neighborlist_max_size}"
         )
     active_stream = _resolve_cuda_stream(stream, distance_matrix)
     with torch.cuda.stream(active_stream):
@@ -146,10 +145,10 @@ def fused_butina(
         returns ``(cluster_ids, centroids)``, where *centroids* contains the input
         index selected as the centroid for each cluster ID.
     """
-    if metric not in ["tanimoto", "cosine"]:
+    if metric not in ("tanimoto", "cosine"):
         raise ValueError(f"metric must be one of ['tanimoto', 'cosine'], got {metric}")
 
-    if cutoff < 0 or cutoff > 1:
+    if not 0 <= cutoff <= 1:
         raise ValueError(f"cutoff must be in [0, 1], got {cutoff}")
 
     (x,), active_stream = _prepare_packed_fingerprints(("x", x), stream=stream)

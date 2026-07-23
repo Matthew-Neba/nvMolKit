@@ -23,7 +23,6 @@ import numpy as np
 import torch
 
 from nvmolkit import _DataStructs
-from nvmolkit._arrayHelpers import *  # noqa: F403
 from nvmolkit._fingerprint_inputs import _prepare_packed_fingerprints
 from nvmolkit.types import ArrayInput, AsyncGpuResult
 
@@ -109,15 +108,13 @@ def crossTanimotoSimilarityMemoryConstrained(
             or None for all-to-all similarity within fingerprint_group_one.
 
     Returns:
-        A numpy array of Tanimoto similarities, with index [i, j] corresponding to the similarity between
+        A NumPy array where element [i, j] is the similarity between fingerprints i and j.
     """
     bits_one, bits_two, active_stream = _fingerprint_inputs(fingerprint_group_one, fingerprint_group_two, None)
     with torch.cuda.stream(active_stream):
-        vals = _DataStructs.CrossTanimotoSimilarityCPURawBuffers(
+        return _DataStructs.CrossTanimotoSimilarityCPURawBuffers(
             bits_one.__cuda_array_interface__, bits_two.__cuda_array_interface__, active_stream.cuda_stream
         )
-    # vals is a numpy ndarray with shape (N, M)
-    return vals
 
 
 # --------------------------------
@@ -179,11 +176,10 @@ def crossCosineSimilarityMemoryConstrained(
             or None for all-to-all similarity within fingerprint_group_one.
 
     Returns:
-        A numpy array of Cosine similarities, with index [i, j] corresponding to the similarity between
+        A NumPy array where element [i, j] is the similarity between fingerprints i and j.
     """
     bits_one, bits_two, active_stream = _fingerprint_inputs(fingerprint_group_one, fingerprint_group_two, None)
     with torch.cuda.stream(active_stream):
-        vals = _DataStructs.CrossCosineSimilarityCPURawBuffers(
+        return _DataStructs.CrossCosineSimilarityCPURawBuffers(
             bits_one.__cuda_array_interface__, bits_two.__cuda_array_interface__, active_stream.cuda_stream
         )
-    return vals

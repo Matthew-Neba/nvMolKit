@@ -15,7 +15,10 @@
 
 #include <boost/python.hpp>
 #include <boost/python/manage_new_object.hpp>
-#include <memory>
+#include <cstddef>
+#include <cstdint>
+#include <stdexcept>
+#include <string>
 
 #include "nvmolkit/array_helpers.h"
 #include "src/butina.h"
@@ -54,12 +57,12 @@ BOOST_PYTHON_MODULE(_clustering) {
         throw std::invalid_argument("Invalid CUDA stream");
       }
       const auto           stream  = *streamOpt;
-      // Extract boost::python::tuple from dict['shape']
+      // Read the matrix shape.
       boost::python::tuple shape   = boost::python::extract<boost::python::tuple>(distanceMatrix["shape"]);
       const int            matDim1 = boost::python::extract<int>(shape[0]);
 
       boost::python::tuple data        = boost::python::extract<boost::python::tuple>(distanceMatrix["data"]);
-      const size_t         dataPointer = boost::python::extract<std::size_t>(data[0]);
+      const std::size_t    dataPointer = boost::python::extract<std::size_t>(data[0]);
       const auto matSpan = nvMolKit::getSpanFromDictElems<double>(reinterpret_cast<void*>(dataPointer), shape);
       auto       result  = nvMolKit::butinaFromDistanceMatrix(matSpan,
                                                        matDim1,
@@ -116,4 +119,4 @@ BOOST_PYTHON_MODULE(_clustering) {
      boost::python::arg("return_centroids") = false,
      boost::python::arg("metric")           = "tanimoto",
      boost::python::arg("stream")           = 0));
-};
+}

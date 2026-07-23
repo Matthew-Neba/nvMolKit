@@ -105,8 +105,7 @@ def test_butina_reordering_matches_rdkit(reordering):
 def test_butina_clustering(size, neighborlist_max_size):
     n = size
     cutoff = 0.1
-    np.random.seed(42)
-    dists = np.random.rand(n, n)
+    dists = np.random.default_rng(42).random((n, n))
     dists = np.abs(dists - dists.T)
     torch_dists = torch.tensor(dists).to("cuda")
     nvmol_res = butina(torch_dists, cutoff, neighborlist_max_size=neighborlist_max_size).torch()
@@ -119,9 +118,7 @@ def test_butina_clustering(size, neighborlist_max_size):
 def test_butina_edge_one_cluster(neighborlist_max_size):
     n = 10
     cutoff = 100.0
-    dists = np.random.rand(n, n)
-    dists = np.abs(dists - dists.T)
-    torch_dists = torch.tensor(dists).to("cuda")
+    torch_dists = torch.zeros((n, n), dtype=torch.float64, device="cuda")
     nvmol_res = butina(torch_dists, cutoff, neighborlist_max_size=neighborlist_max_size).torch()
     assert torch.all(nvmol_res == 0)
 
@@ -130,10 +127,7 @@ def test_butina_edge_one_cluster(neighborlist_max_size):
 def test_butina_edge_n_clusters(neighborlist_max_size):
     n = 10
     cutoff = 1e-8
-    dists = np.random.rand(n, n)
-    dists = np.abs(dists - dists.T)
-    torch_dists = torch.tensor(dists).to("cuda")
-    torch_dists = torch.clip(torch_dists, min=0.01)
+    torch_dists = torch.ones((n, n), dtype=torch.float64, device="cuda")
     torch_dists.fill_diagonal_(0)
     nvmol_res = butina(torch_dists, cutoff, neighborlist_max_size=neighborlist_max_size).torch()
     assert torch.all(nvmol_res.sort()[0] == torch.arange(10).to("cuda"))
@@ -142,8 +136,7 @@ def test_butina_edge_n_clusters(neighborlist_max_size):
 def test_butina_returns_centroids():
     n = 25
     cutoff = 0.2
-    np.random.seed(123)
-    dists = np.random.rand(n, n)
+    dists = np.random.default_rng(123).random((n, n))
     dists = np.abs(dists - dists.T)
     torch_dists = torch.tensor(dists).to("cuda")
     cluster_ids, centroids = butina(torch_dists, cutoff, return_centroids=True)
@@ -166,8 +159,7 @@ def test_butina_returns_centroids():
 def test_butina_accepts_array_input_types(input_kind):
     n = 20
     cutoff = 0.2
-    np.random.seed(456)
-    dists = np.random.rand(n, n)
+    dists = np.random.default_rng(456).random((n, n))
     dists = np.abs(dists - dists.T)
     torch_dists = torch.tensor(dists, device="cuda", dtype=torch.float64)
     expected = butina(torch_dists, cutoff).torch().cpu()
@@ -186,8 +178,7 @@ def test_butina_accepts_array_input_types(input_kind):
 def test_butina_on_explicit_stream():
     n = 100
     cutoff = 0.1
-    np.random.seed(42)
-    dists = np.random.rand(n, n)
+    dists = np.random.default_rng(42).random((n, n))
     dists = np.abs(dists - dists.T)
     torch_dists = torch.tensor(dists).to("cuda")
 
@@ -228,12 +219,26 @@ def test_butina_invalid_neighborlist_max_size(invalid_size):
 
 def generate_clustered_fingerprints(n, num_words=32, num_clusters=10, noise_range=2, seed=42):
     """Create bit-packed int32 fingerprints with controllable cluster structure."""
-    torch.manual_seed(seed)
-    base_vectors = torch.randint(-(2**31 - 1), 2**31 - 1, size=(num_clusters, num_words), dtype=torch.int32).cuda()
+    generator = torch.Generator(device="cuda").manual_seed(seed)
+    base_vectors = torch.randint(
+        -(2**31 - 1),
+        2**31 - 1,
+        size=(num_clusters, num_words),
+        dtype=torch.int32,
+        device="cuda",
+        generator=generator,
+    )
     x = torch.zeros((n, num_words), dtype=torch.int32, device="cuda")
     for i in range(n):
         x[i] = base_vectors[i % num_clusters]
-        noise = torch.randint(0, noise_range, size=(num_words,), dtype=torch.int32, device="cuda")
+        noise = torch.randint(
+            0,
+            noise_range,
+            size=(num_words,),
+            dtype=torch.int32,
+            device="cuda",
+            generator=generator,
+        )
         x[i] = x[i] ^ noise
     return x
 
@@ -246,10 +251,13 @@ def compute_pairwise_similarity_cpu(x_np, metric="tanimoto"):
     dots = bits @ bits.T
     if metric == "tanimoto":
         denom = popcnt[:, None] + popcnt[None, :] - dots
-        sim = np.where(denom > 0, dots / denom, 0.0)
+        sim = np.zeros_like(dots)
+        np.divide(dots, denom, out=sim, where=denom > 0)
+        sim[denom == 0] = 1.0
     elif metric == "cosine":
         denom = np.sqrt(popcnt[:, None] * popcnt[None, :])
-        sim = np.where(denom > 0, dots / denom, 0.0)
+        sim = np.zeros_like(dots)
+        np.divide(dots, denom, out=sim, where=denom > 0)
     else:
         raise ValueError(f"Unknown metric: {metric}")
     return sim
@@ -335,8 +343,15 @@ def test_fused_butina_all_identical(metric):
 @pytest.mark.parametrize("metric", ["tanimoto", "cosine"])
 def test_fused_butina_all_singletons(metric):
     n = 50
-    torch.manual_seed(42)
-    x = torch.randint(-(2**31 - 1), 2**31 - 1, (n, 32), dtype=torch.int32).cuda()
+    generator = torch.Generator(device="cuda").manual_seed(42)
+    x = torch.randint(
+        -(2**31 - 1),
+        2**31 - 1,
+        (n, 32),
+        dtype=torch.int32,
+        device="cuda",
+        generator=generator,
+    )
     clusters = fused_butina_clusters(x, cutoff=0.001, metric=metric)
     assert len(clusters) == n
     for c in clusters:
@@ -391,12 +406,26 @@ def test_fused_butina_accepts_int32_and_uint32():
 
 
 def test_fused_butina_on_explicit_stream():
-    n = 100
-    x = generate_clustered_fingerprints(n, num_words=32, num_clusters=10)
+    x = generate_clustered_fingerprints(100, num_words=32, num_clusters=10)
+    expected = fused_butina(x, cutoff=0.4).torch()
+
     s = torch.cuda.Stream()
-    cluster_ids = fused_butina(x, cutoff=0.4, stream=s)
+    actual = fused_butina(x, cutoff=0.4, stream=s).torch()
     s.synchronize()
-    assert cluster_ids.torch().shape == (n,)
+
+    torch.testing.assert_close(actual, expected)
+
+
+@pytest.mark.parametrize(
+    ("metric", "expected_cluster_count"),
+    [("tanimoto", 1), ("cosine", 10)],
+)
+def test_fused_butina_empty_fingerprints(metric, expected_cluster_count):
+    x = torch.zeros((10, 32), dtype=torch.uint32, device="cuda")
+
+    clusters = fused_butina_clusters(x, cutoff=0.5, metric=metric)
+
+    assert len(clusters) == expected_cluster_count
 
 
 def test_fused_butina_invalid_metric():

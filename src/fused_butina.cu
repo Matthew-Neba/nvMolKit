@@ -21,8 +21,6 @@
 namespace nvMolKit {
 namespace {
 
-// Only fingerprint clustering with the Tanimoto and cosine similarity metrics is currently supported.
-
 namespace cg = cooperative_groups;
 
 constexpr int kInitialArgMaxBlockSize = 256;
@@ -83,16 +81,28 @@ __global__ void initialNeighborCountKernel(const cuda::std::span<const std::uint
                                            const cuda::std::span<int>                 neighborCounts,
                                            int                                        numWords,
                                            float                                      threshold) {
-  const int rowTile    = blockIdx.x;
-  const int columnTile = blockIdx.y;
+  const int n                 = static_cast<int>(neighborCounts.size());
+  const int numTiles          = (n + kInitialTileSize - 1) / kInitialTileSize;
+  const int firstRowTile      = blockIdx.y;
+  const int secondRowTile     = numTiles - 1 - firstRowTile;
+  const int firstRowTileCount = numTiles - firstRowTile;
+  const int gridColumn        = blockIdx.x;
 
-  // Similarity is symmetric, so the lower half of the matrix would repeat work from the upper half. Compute each
-  // off-diagonal tile once and reuse its results to update the neighbor counts for both sides. Cuts work in half
-  if (columnTile < rowTile) {
-    return;
+  // Due to the symmetric nature of the similarity matrix, pair outer rows of its upper triangle in a compact grid,
+  // avoiding almost half the blocks. For an odd tile count, the unused half of the center row returns without repeats.
+  int rowTile;
+  int columnTile;
+  if (gridColumn < firstRowTileCount) {
+    rowTile    = firstRowTile;
+    columnTile = firstRowTile + gridColumn;
+  } else {
+    if (firstRowTile == secondRowTile) {
+      return;
+    }
+    rowTile    = secondRowTile;
+    columnTile = secondRowTile + gridColumn - firstRowTileCount;
   }
 
-  const int n           = static_cast<int>(neighborCounts.size());
   const int rowStart    = rowTile * kInitialTileSize;
   const int columnStart = columnTile * kInitialTileSize;
   const int rowEnd      = min(rowStart + kInitialTileSize, n) - 1;
@@ -224,15 +234,15 @@ __global__ void initialNeighborCountKernel(const cuda::std::span<const std::uint
   }
 }
 
-// Select the initial centroid, We will use argmax kernel over neighborCounts
+// Select the initial centroid from the neighbor counts.
 __global__ void initialArgMaxKernel(const cuda::std::span<const int> neighborCounts, int* maxValue, int* maxIndex) {
   std::uint64_t candidate = 0;
-  // we tile over neighbors here
+  // Scan neighbor counts in thread-strided order.
   for (int row = threadIdx.x; row < static_cast<int>(neighborCounts.size()); row += blockDim.x) {
     candidate = cubMax{}(candidate, makeButinaCandidate(neighborCounts[row], row));
   }
 
-  // reduce the results of the tiling
+  // Reduce to the maximum candidate.
   __shared__ typename cub::BlockReduce<std::uint64_t, kInitialArgMaxBlockSize>::TempStorage storage;
   candidate = cub::BlockReduce<std::uint64_t, kInitialArgMaxBlockSize>(storage).Reduce(candidate, cubMax());
   if (threadIdx.x == 0) {
@@ -355,13 +365,13 @@ __global__ void updateNeighborCountsAndBlockMaxKernel(const cuda::std::span<cons
   }
 }
 
-// Reduce the blockMaxima array into the centroid
+// Reduce the block maxima to select the next centroid.
 __global__ void selectNextCentroidKernel(const cuda::std::span<const std::uint64_t> blockMaxima,
                                          int*                                       maxValue,
                                          int*                                       maxIndex,
                                          cudaGraphConditionalHandle                 handle) {
   std::uint64_t candidate = 0;
-  // Once again we are tiling here
+  // Scan block maxima in thread-strided order.
   for (int block = threadIdx.x; block < static_cast<int>(blockMaxima.size()); block += blockDim.x) {
     candidate = cubMax{}(candidate, blockMaxima[block]);
   }
@@ -369,9 +379,7 @@ __global__ void selectNextCentroidKernel(const cuda::std::span<const std::uint64
   __shared__ typename cub::BlockReduce<std::uint64_t, kIterationBlockSize>::TempStorage storage;
   candidate = cub::BlockReduce<std::uint64_t, kIterationBlockSize>(storage).Reduce(candidate, cubMax());
   if (threadIdx.x == 0) {
-    // Save the next centroid and continue the CUDA graph while a molecule has an active neighbor besides itself. We do
-    // this here instead of in another conditional checking kernel since we already have the maxNeighborCount in a
-    // register
+    // Continue while the selected centroid has an active neighbor besides itself.
     const int maxNeighborCount = storeButinaCandidate(candidate, maxValue, maxIndex);
     cudaGraphSetConditional(handle, maxNeighborCount > 1 ? 1 : 0);
   }
@@ -485,13 +493,13 @@ ButinaResult fusedButinaGpuImpl(cuda::std::span<const std::uint32_t> fingerprint
   cudaCheckError(cudaMemsetAsync(neighborCountsSpan.data(), 0, neighborCountsSpan.size_bytes(), stream));
   const int numInitialTiles = (n + kInitialTileSize - 1) / kInitialTileSize;
   initialNeighborCountKernel<Metric>
-    <<<dim3(numInitialTiles, numInitialTiles), kInitialBlockSize, 0, stream>>>(fingerprints,
-                                                                               bitCountsSpan,
-                                                                               sortedBitCountsSpan,
-                                                                               sortedIndicesSpan,
-                                                                               neighborCountsSpan,
-                                                                               numWords,
-                                                                               threshold);
+    <<<dim3(numInitialTiles + 1, (numInitialTiles + 1) / 2), kInitialBlockSize, 0, stream>>>(fingerprints,
+                                                                                             bitCountsSpan,
+                                                                                             sortedBitCountsSpan,
+                                                                                             sortedIndicesSpan,
+                                                                                             neighborCountsSpan,
+                                                                                             numWords,
+                                                                                             threshold);
   cudaCheckError(cudaGetLastError());
   initialArgMaxKernel<<<1, kInitialArgMaxBlockSize, 0, stream>>>(neighborCountsSpan, maxValue.data(), maxIndex.data());
   cudaCheckError(cudaGetLastError());
@@ -573,7 +581,7 @@ ButinaResult fusedButinaGpu(cuda::std::span<const std::uint32_t> fingerprints,
   if (fingerprints.size() != static_cast<std::size_t>(numFingerprints) * static_cast<std::size_t>(numWords)) {
     throw std::invalid_argument("Fingerprint buffer size does not match its shape");
   }
-  if (cutoff < 0.0 || cutoff > 1.0) {
+  if (!(cutoff >= 0.0 && cutoff <= 1.0)) {
     throw std::invalid_argument("cutoff must be in [0, 1]");
   }
   if (metric != FingerprintSimilarityMetric::Tanimoto && metric != FingerprintSimilarityMetric::Cosine) {

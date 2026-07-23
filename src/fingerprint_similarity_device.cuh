@@ -7,7 +7,7 @@
 #include <cuda_runtime.h>
 
 #include <cmath>
-#include <type_traits>
+#include <cuda/std/functional>
 
 namespace nvMolKit {
 
@@ -32,11 +32,7 @@ __device__ __forceinline__ Real fingerprintSimilarityDenominator(const int inter
     return static_cast<Real>(lhsBitCount + rhsBitCount - intersection);
   } else if constexpr (Metric == FingerprintSimilarityMetric::Cosine) {
     const Real product = static_cast<Real>(lhsBitCount) * static_cast<Real>(rhsBitCount);
-    if constexpr (std::is_same_v<Real, float>) {
-      return sqrtf(product);
-    } else {
-      return sqrt(product);
-    }
+    return sqrt(product);
   } else {
     static_assert(Metric == FingerprintSimilarityMetric::Tanimoto || Metric == FingerprintSimilarityMetric::Cosine,
                   "Unsupported fingerprint similarity metric");
@@ -56,8 +52,8 @@ template <FingerprintSimilarityMetric Metric>
 __device__ __forceinline__ bool fingerprintSimilarityCanReach(const int   lhsBitCount,
                                                               const int   rhsBitCount,
                                                               const float threshold) {
-  const int minBitCount = lhsBitCount < rhsBitCount ? lhsBitCount : rhsBitCount;
-  const int maxBitCount = lhsBitCount > rhsBitCount ? lhsBitCount : rhsBitCount;
+  const int minBitCount = cuda::std::min(lhsBitCount, rhsBitCount);
+  const int maxBitCount = cuda::std::max(lhsBitCount, rhsBitCount);
   if constexpr (Metric == FingerprintSimilarityMetric::Tanimoto) {
     // The intersection cannot exceed the smaller population and the union cannot be smaller than the larger one.
     return static_cast<float>(minBitCount) >= threshold * static_cast<float>(maxBitCount);

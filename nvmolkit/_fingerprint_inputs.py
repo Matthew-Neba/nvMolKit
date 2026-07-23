@@ -25,6 +25,8 @@ def _prepare_packed_fingerprints(
                 raise ValueError(f"{name} must be 2D, got shape={tuple(tensor.shape)}")
             if tensor.dtype not in (torch.int32, torch.uint32):
                 raise ValueError(f"{name} must have dtype int32 or uint32")
+            if tensor.shape[1] == 0:
+                raise ValueError(f"{name} must contain at least one fingerprint word")
             tensor = tensor.contiguous()
             if tensor.dtype == torch.int32:
                 tensor = tensor.view(torch.uint32)
