@@ -21,7 +21,7 @@
 #include <cstdint>
 #include <cuda/std/span>
 
-#include "src/fingerprint_similarity_device.cuh"
+#include "src/fingerprint_similarity.h"
 #include "src/utils/device_vector.h"
 
 namespace nvMolKit {
