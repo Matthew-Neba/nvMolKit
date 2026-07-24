@@ -4,6 +4,7 @@
 #include <cooperative_groups.h>
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <cub/block/block_reduce.cuh>
@@ -29,6 +30,7 @@ constexpr int kInitialBlockSize       = 256;
 constexpr int kInitialColumnGroups    = kInitialTileSize / 32;
 constexpr int kInitialWordChunkSize   = 32;
 constexpr int kInitialRowsPerWarp     = kInitialTileSize / (kInitialBlockSize / 32);
+constexpr int kMaxGridDimensionY      = 65535;
 constexpr int kIterationBlockSize     = 128;
 
 template <FingerprintSimilarityMetric Metric>
@@ -80,10 +82,11 @@ __global__ void initialNeighborCountKernel(const cuda::std::span<const std::uint
                                            const cuda::std::span<const int>           sortedIndices,
                                            const cuda::std::span<int>                 neighborCounts,
                                            int                                        numWords,
-                                           float                                      threshold) {
+                                           float                                      threshold,
+                                           int                                        rowTileOffset) {
   const int n                 = static_cast<int>(neighborCounts.size());
   const int numTiles          = (n + kInitialTileSize - 1) / kInitialTileSize;
-  const int firstRowTile      = blockIdx.y;
+  const int firstRowTile      = rowTileOffset + static_cast<int>(blockIdx.y);
   const int secondRowTile     = numTiles - 1 - firstRowTile;
   const int firstRowTileCount = numTiles - firstRowTile;
   const int gridColumn        = blockIdx.x;
@@ -491,16 +494,21 @@ ButinaResult fusedButinaGpuImpl(cuda::std::span<const std::uint32_t> fingerprint
                                                  sizeof(int) * 8,
                                                  stream));
   cudaCheckError(cudaMemsetAsync(neighborCountsSpan.data(), 0, neighborCountsSpan.size_bytes(), stream));
-  const int numInitialTiles = (n + kInitialTileSize - 1) / kInitialTileSize;
-  initialNeighborCountKernel<Metric>
-    <<<dim3(numInitialTiles + 1, (numInitialTiles + 1) / 2), kInitialBlockSize, 0, stream>>>(fingerprints,
-                                                                                             bitCountsSpan,
-                                                                                             sortedBitCountsSpan,
-                                                                                             sortedIndicesSpan,
-                                                                                             neighborCountsSpan,
-                                                                                             numWords,
-                                                                                             threshold);
-  cudaCheckError(cudaGetLastError());
+  const int numInitialTiles    = (n + kInitialTileSize - 1) / kInitialTileSize;
+  const int numInitialRowTiles = (numInitialTiles + 1) / 2;
+  for (int rowTileOffset = 0; rowTileOffset < numInitialRowTiles; rowTileOffset += kMaxGridDimensionY) {
+    const int numRowsInBatch = std::min(kMaxGridDimensionY, numInitialRowTiles - rowTileOffset);
+    initialNeighborCountKernel<Metric>
+      <<<dim3(numInitialTiles + 1, numRowsInBatch), kInitialBlockSize, 0, stream>>>(fingerprints,
+                                                                                    bitCountsSpan,
+                                                                                    sortedBitCountsSpan,
+                                                                                    sortedIndicesSpan,
+                                                                                    neighborCountsSpan,
+                                                                                    numWords,
+                                                                                    threshold,
+                                                                                    rowTileOffset);
+    cudaCheckError(cudaGetLastError());
+  }
   initialArgMaxKernel<<<1, kInitialArgMaxBlockSize, 0, stream>>>(neighborCountsSpan, maxValue.data(), maxIndex.data());
   cudaCheckError(cudaGetLastError());
   setupRange.pop();
