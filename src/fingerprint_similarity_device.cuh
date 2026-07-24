@@ -9,12 +9,9 @@
 #include <cmath>
 #include <cuda/std/functional>
 
-namespace nvMolKit {
+#include "src/fingerprint_similarity.h"
 
-enum class FingerprintSimilarityMetric {
-  Tanimoto,
-  Cosine
-};
+namespace nvMolKit {
 
 namespace detail {
 
