@@ -454,15 +454,12 @@ void renumberClustersBySize(const cuda::std::span<int> clusters,
 }
 
 // Build packed sort keys: higher hit count (primary key), then higher point index (secondary key).
-// Bits 32-63 hold the hit count; bits 0-31 hold the point index and can be recovered with a bit mask.
 __global__ void setupFixedOrderSortKeysKernel(const cuda::std::span<const int> hitCounts,
                                               const cuda::std::span<uint64_t>  sortKeys) {
   const int numPoints = hitCounts.size();
   const int idx       = blockIdx.x * blockDim.x + threadIdx.x;
   if (idx < numPoints) {
-    const uint64_t count = hitCounts[idx];
-    const uint64_t point = idx;
-    sortKeys[idx]        = (count << 32) | point;
+    sortKeys[idx] = makeButinaCandidate(hitCounts[idx], idx);
   }
 }
 
@@ -541,8 +538,8 @@ __global__ void prepareFixedOrderCandidateKernel(const cuda::std::span<const uin
     int candidate = INT_MAX;
 
     if (sortedPos < numPoints) {
-      // Use the bit mask to get the point index from the packed sort key.
-      const int pointIdx = sortedKeys[sortedPos] & 0xffffffffULL;
+      // Decode the point index from the packed sort key.
+      const int pointIdx = butinaCandidateIndex(sortedKeys[sortedPos]);
       // Points already assigned to a cluster cannot become centroids.
       if (clusters[pointIdx] < 0) {
         candidate = sortedPos;
@@ -566,7 +563,7 @@ __global__ void prepareFixedOrderCandidateKernel(const cuda::std::span<const uin
       continue;
     }
 
-    const int pointIdx     = sortedKeys[firstPos] & 0xffffffffULL;
+    const int pointIdx     = butinaCandidateIndex(sortedKeys[firstPos]);
     bool      hasNeighbors = hitCounts[pointIdx] > 1;
 
     if (tid == 0) {
